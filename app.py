@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import base64
-import cgi
 import html
 import hmac
 import hashlib
@@ -14,9 +13,12 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -63,6 +65,27 @@ FILE_KINDS = {
     "photo": "Photo",
     "video": "Video",
 }
+
+
+class MultipartField:
+    def __init__(self, name, filename, content_type, data, value=""):
+        self.name = name
+        self.filename = filename
+        self.type = content_type
+        self.file = BytesIO(data)
+        self.value = value
+
+
+class MultipartForm(dict):
+    def add(self, field):
+        if field.name in self:
+            existing = self[field.name]
+            if isinstance(existing, list):
+                existing.append(field)
+            else:
+                self[field.name] = [existing, field]
+        else:
+            self[field.name] = field
 
 
 def now():
@@ -420,13 +443,32 @@ class App(BaseHTTPRequestHandler):
         if length > MAX_UPLOAD_BYTES:
             raise ValueError("Upload too large")
         if content_type.startswith("multipart/form-data"):
-            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type})
+            body = self.rfile.read(length)
+            parser_input = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body
+            message = BytesParser(policy=email_policy).parsebytes(parser_input)
+            form = MultipartForm()
+            for part in message.iter_parts():
+                disposition = part.get("Content-Disposition", "")
+                if "form-data" not in disposition:
+                    continue
+                name = part.get_param("name", header="content-disposition")
+                if not name:
+                    continue
+                filename = part.get_filename()
+                payload = part.get_payload(decode=True) or b""
+                if filename:
+                    field = MultipartField(name, filename, part.get_content_type(), payload)
+                else:
+                    charset = part.get_content_charset() or "utf-8"
+                    value = payload.decode(charset, errors="replace")
+                    field = MultipartField(name, "", part.get_content_type(), b"", value)
+                form.add(field)
             return form
         raw = self.rfile.read(length).decode()
         return urllib.parse.parse_qs(raw)
 
     def val(self, form, name, default=""):
-        if isinstance(form, cgi.FieldStorage):
+        if isinstance(form, MultipartForm):
             field = form[name] if name in form else None
             if field is None or getattr(field, "filename", None):
                 return default
@@ -434,7 +476,7 @@ class App(BaseHTTPRequestHandler):
         return form.get(name, [default])[0].strip()
 
     def vals(self, form, name):
-        if isinstance(form, cgi.FieldStorage):
+        if isinstance(form, MultipartForm):
             if name not in form:
                 return []
             fields = form[name] if isinstance(form[name], list) else [form[name]]
@@ -618,7 +660,7 @@ class App(BaseHTTPRequestHandler):
             grade_level = self.val(form, "grade_level")
             if not name or not school or not grade_level:
                 return self.student_new_get("Please fill in the student name, school, and grade level.")
-            photo_field = form["profile_photo"] if isinstance(form, cgi.FieldStorage) and "profile_photo" in form else None
+            photo_field = form["profile_photo"] if isinstance(form, MultipartForm) and "profile_photo" in form else None
             photo_id = self.save_file(photo_field, "profile_photo", self.user["id"])
             with db() as conn:
                 student_id = conn.execute(
@@ -698,7 +740,7 @@ class App(BaseHTTPRequestHandler):
             grade_level = self.val(form, "grade_level")
             if not name or not school or not grade_level:
                 return self.student_edit_get(student_id, "Please fill in the student name, school, and grade level.")
-            photo_field = form["profile_photo"] if isinstance(form, cgi.FieldStorage) and "profile_photo" in form else None
+            photo_field = form["profile_photo"] if isinstance(form, MultipartForm) and "profile_photo" in form else None
             new_photo_id = self.save_file(photo_field, "profile_photo", self.user["id"])
             with db() as conn:
                 student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
@@ -950,7 +992,7 @@ class App(BaseHTTPRequestHandler):
                     "INSERT INTO updates (student_id,note,status,created_by,created_at) VALUES (?,?,?,?,?)",
                     (student_id, note, "draft", self.user["id"], now()),
                 ).lastrowid
-            if isinstance(form, cgi.FieldStorage):
+            if isinstance(form, MultipartForm):
                 if "report_card" in form:
                     fid = self.save_file(form["report_card"], "report_card", self.user["id"], update_id)
                     if fid:
