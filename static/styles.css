@@ -112,6 +112,16 @@ h2 { font-size: 1.25rem; }
   text-transform: uppercase;
 }
 .muted { color: var(--muted); }
+.public-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: center;
+}
+.public-links a {
+  color: var(--green-dark);
+  font-weight: 800;
+}
 .alert {
   color: var(--red);
   font-weight: 700;

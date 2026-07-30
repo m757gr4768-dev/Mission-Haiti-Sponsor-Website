@@ -389,6 +389,8 @@ class App(BaseHTTPRequestHandler):
                 return self.privacy_page()
             if self.path_only == "/terms" and method == "GET":
                 return self.terms_page()
+            if self.path_only == "/sms" and method == "GET":
+                return self.sms_page()
             if self.path_only == "/login":
                 return self.login_get() if method == "GET" else self.login_post()
             if self.path_only == "/forgot-password":
@@ -538,7 +540,7 @@ class App(BaseHTTPRequestHandler):
         </head>
         <body>
           <main class="shell legal">
-            <p><a href="/login">Mission-Haiti sponsor portal</a></p>
+            <p class="public-links"><a href="/login">Mission-Haiti sponsor portal</a> <a href="/sms">SMS opt-in</a> <a href="/privacy">Privacy</a> <a href="/terms">Terms</a></p>
             {body}
           </main>
         </body>
@@ -569,6 +571,20 @@ class App(BaseHTTPRequestHandler):
         </section>
         """
         return self.send_html(self.public_page("SMS Terms", body))
+
+    def sms_page(self):
+        body = """
+        <section class="panel legalcopy">
+          <h1>SMS Sponsor Update Alerts</h1>
+          <p>Mission-Haiti offers optional SMS alerts for sponsors who want to know when a new student update is available in the secure sponsor portal.</p>
+          <p>Sponsors opt in by giving Mission-Haiti their mobile phone number and requesting SMS update alerts during sponsorship onboarding or direct communication with Mission-Haiti staff. Staff or administrators then record the sponsor phone number and SMS notification preference in the secure sponsor portal.</p>
+          <p>SMS alerts may say that a new update, photo, school note, or report card is ready to view. Private student details are not sent by text. Sponsors must sign in to the secure portal to view student information.</p>
+          <p>Message frequency varies based on when student updates are approved. Message and data rates may apply. Reply STOP to opt out of SMS notifications. Reply HELP for help.</p>
+          <p>Mobile numbers and SMS opt-in information are used only for Mission-Haiti sponsor update notifications and related account messages. They are not sold, rented, or shared with third parties for marketing or promotional purposes.</p>
+          <p>See our <a href="/privacy">Privacy Policy</a> and <a href="/terms">SMS Terms and Conditions</a>. Questions can be sent to <a href="mailto:paul@mission-haiti.org">paul@mission-haiti.org</a>.</p>
+        </section>
+        """
+        return self.send_html(self.public_page("SMS Opt-In", body))
 
     def form_fields(self):
         content_type = self.headers.get("Content-Type", "")
@@ -693,6 +709,7 @@ class App(BaseHTTPRequestHandler):
             <label>Password <input required type="password" name="password" autocomplete="current-password"></label>
             <button class="primary">Sign in</button>
             <p class="muted"><a href="/forgot-password">Set or reset sponsor password</a></p>
+            <p class="muted public-links"><a href="/sms">SMS opt-in</a> <a href="/privacy">Privacy</a> <a href="/terms">Terms</a></p>
             <p class="muted">Demo: admin@mission-haiti.local / admin123</p>
           </form>
         </section>
