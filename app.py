@@ -11,6 +11,7 @@ import sqlite3
 import ssl
 import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -57,6 +58,9 @@ SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USERNAME)
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Mission-Haiti")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ("1", "true", "yes", "on")
 SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "false").lower() in ("1", "true", "yes", "on")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
 PASSWORD_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
 ROLES = {"admin": "Admin", "staff": "Haiti staff", "sponsor": "Sponsor"}
@@ -174,6 +178,30 @@ def send_email(recipient, subject, body):
     return "sent", "Email sent."
 
 
+def send_sms(recipient, body):
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_FROM_NUMBER:
+        print(f"SMS SKIPPED to {recipient}: Twilio is not configured\n{body}\n")
+        return "skipped", "Twilio is not configured."
+    if not recipient:
+        return "skipped", "Sponsor has no phone number."
+
+    data = urllib.parse.urlencode({"To": recipient, "From": TWILIO_FROM_NUMBER, "Body": body}).encode()
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+    request = urllib.request.Request(url, data=data, method="POST")
+    auth = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode()).decode()
+    request.add_header("Authorization", f"Basic {auth}")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = response.read().decode(errors="replace")
+    except Exception as exc:
+        print(f"SMS FAILED to {recipient}: {exc}")
+        return "failed", str(exc)
+
+    print(f"SMS SENT to {recipient}")
+    return "sent", payload[:500]
+
+
 def password_token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -227,6 +255,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
+                phone TEXT,
+                notification_preference TEXT NOT NULL DEFAULT 'email' CHECK(notification_preference IN ('email','sms','email_sms')),
                 user_id INTEGER UNIQUE,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id)
@@ -266,6 +296,19 @@ def init_db():
                 FOREIGN KEY(update_id) REFERENCES updates(id),
                 FOREIGN KEY(sponsor_id) REFERENCES sponsors(id)
             );
+            CREATE TABLE IF NOT EXISTS sms_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                update_id INTEGER NOT NULL,
+                sponsor_id INTEGER NOT NULL,
+                recipient_phone TEXT NOT NULL,
+                body TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                provider_message TEXT,
+                attempted_at TEXT,
+                FOREIGN KEY(update_id) REFERENCES updates(id),
+                FOREIGN KEY(sponsor_id) REFERENCES sponsors(id)
+            );
             CREATE TABLE IF NOT EXISTS password_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -293,6 +336,11 @@ def init_db():
             conn.execute("ALTER TABLE students ADD COLUMN birthdate TEXT")
         if "sex" not in existing_student_columns:
             conn.execute("ALTER TABLE students ADD COLUMN sex TEXT")
+        existing_sponsor_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sponsors)").fetchall()}
+        if "phone" not in existing_sponsor_columns:
+            conn.execute("ALTER TABLE sponsors ADD COLUMN phone TEXT")
+        if "notification_preference" not in existing_sponsor_columns:
+            conn.execute("ALTER TABLE sponsors ADD COLUMN notification_preference TEXT NOT NULL DEFAULT 'email'")
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count:
             return
@@ -394,6 +442,8 @@ class App(BaseHTTPRequestHandler):
                     return self.update_resend(update_id)
             if self.path_only.startswith("/emails/") and self.path_only.endswith("/retry") and method == "POST":
                 return self.email_retry(int(self.path_only.split("/")[-2]))
+            if self.path_only.startswith("/sms/") and self.path_only.endswith("/retry") and method == "POST":
+                return self.sms_retry(int(self.path_only.split("/")[-2]))
             if self.path_only.startswith("/portal/students/") and method == "GET":
                 return self.portal_student(int(self.path_only.split("/")[-1]))
             return self.not_found()
@@ -999,6 +1049,7 @@ class App(BaseHTTPRequestHandler):
                     for file in conn.execute(f"SELECT storage_name FROM update_files WHERE update_id IN ({qmarks(update_ids)})", update_ids).fetchall():
                         storage_names.append(file["storage_name"])
                     conn.execute(f"DELETE FROM email_notifications WHERE update_id IN ({qmarks(update_ids)})", update_ids)
+                    conn.execute(f"DELETE FROM sms_notifications WHERE update_id IN ({qmarks(update_ids)})", update_ids)
                 conn.execute("DELETE FROM sponsor_students WHERE student_id=?", (student_id,))
                 conn.execute("DELETE FROM students WHERE id=?", (student_id,))
                 if student["profile_photo_file_id"]:
@@ -1018,15 +1069,22 @@ class App(BaseHTTPRequestHandler):
         for link in links:
             names.setdefault(link["sponsor_id"], []).append(link["name"])
         rows = "".join(
-            f'<tr><td>{escape(s["name"])}</td><td>{escape(s["email"])}</td><td>{escape(", ".join(names.get(s["id"], [])))}</td><td><div class="actions"><a class="button" href="/sponsors/{s["id"]}/edit">Edit</a><form method="post" action="/sponsors/{s["id"]}/invite"><button>Send password link</button></form><form method="post" action="/sponsors/{s["id"]}/delete"><button class="danger">Remove</button></form></div></td></tr>'
+            f'<tr><td>{escape(s["name"])}</td><td>{escape(s["email"])}</td><td>{escape(s["phone"] or "")}</td><td>{escape(self.notification_label(s["notification_preference"]))}</td><td>{escape(", ".join(names.get(s["id"], [])))}</td><td><div class="actions"><a class="button" href="/sponsors/{s["id"]}/edit">Edit</a><form method="post" action="/sponsors/{s["id"]}/invite"><button>Send password link</button></form><form method="post" action="/sponsors/{s["id"]}/delete"><button class="danger">Remove</button></form></div></td></tr>'
             for s in sponsors
         )
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Records</p><h1>Sponsors</h1></div><a class="button primary" href="/sponsors/new">Add sponsor</a></header>
         {f'<p class="notice">{escape(message)}</p>' if message else ''}
-        <div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Linked students</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="4">No sponsors yet.</td></tr>'}</tbody></table></div>
+        <div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Notify by</th><th>Linked students</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="6">No sponsors yet.</td></tr>'}</tbody></table></div>
         """
         return self.send_html(self.layout("Sponsors", body))
+
+    def notification_label(self, preference):
+        return {"email": "Email", "sms": "SMS", "email_sms": "Email + SMS"}.get(preference or "email", "Email")
+
+    def notification_options(self, selected="email"):
+        options = (("email", "Email only"), ("sms", "SMS only"), ("email_sms", "Email + SMS"))
+        return "".join(f'<option value="{value}" {"selected" if selected == value else ""}>{label}</option>' for value, label in options)
 
     def sponsor_new_get(self):
         self.require_roles("admin")
@@ -1038,6 +1096,9 @@ class App(BaseHTTPRequestHandler):
         <form class="panel form" method="post">
           <label>Name <input required name="name"></label>
           <label>Email <input required type="email" name="email"></label>
+          <label>Phone for SMS <input type="tel" name="phone" placeholder="+16055551234"></label>
+          <label>Update notifications <select name="notification_preference">{self.notification_options()}</select></label>
+          <p class="hint">Use international format for SMS, like +16055551234. Only send texts to sponsors who have agreed to receive them.</p>
           <label class="check"><input type="checkbox" name="send_invite" checked> Email this sponsor a secure password setup link</label>
           <fieldset><legend>Linked students</legend>{options or '<p class="muted">Add students first.</p>'}</fieldset>
           <button class="primary">Save sponsor</button>
@@ -1049,16 +1110,23 @@ class App(BaseHTTPRequestHandler):
         self.require_roles("admin")
         form = self.form_fields()
         name, email = self.val(form, "name"), self.val(form, "email").lower()
+        phone = self.val(form, "phone")
+        notification_preference = self.val(form, "notification_preference") or "email"
         send_invite = bool(self.val(form, "send_invite"))
         if not name or not email:
             return self.sponsor_new_get()
+        if notification_preference not in ("email", "sms", "email_sms"):
+            return self.error_page(HTTPStatus.BAD_REQUEST, "Please choose a valid notification preference.")
         try:
             with db() as conn:
                 user_id = conn.execute(
                     "INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)",
                     (name, email, hash_password(secrets.token_urlsafe(32)), "sponsor", now()),
                 ).lastrowid
-                sponsor_id = conn.execute("INSERT INTO sponsors (name,email,user_id,created_at) VALUES (?,?,?,?)", (name, email, user_id, now())).lastrowid
+                sponsor_id = conn.execute(
+                    "INSERT INTO sponsors (name,email,phone,notification_preference,user_id,created_at) VALUES (?,?,?,?,?,?)",
+                    (name, email, phone, notification_preference, user_id, now()),
+                ).lastrowid
                 conn.execute("UPDATE users SET sponsor_id=? WHERE id=?", (sponsor_id, user_id))
                 for student_id in self.vals(form, "student_ids"):
                     conn.execute("INSERT OR IGNORE INTO sponsor_students (sponsor_id,student_id) VALUES (?,?)", (sponsor_id, int(student_id)))
@@ -1092,6 +1160,9 @@ class App(BaseHTTPRequestHandler):
           {f'<p class="alert">{escape(message)}</p>' if message else ''}
           <label>Name <input required name="name" value="{escape(sponsor["name"])}"></label>
           <label>Email <input required type="email" name="email" value="{escape(sponsor["email"])}"></label>
+          <label>Phone for SMS <input type="tel" name="phone" value="{escape(sponsor["phone"] or "")}" placeholder="+16055551234"></label>
+          <label>Update notifications <select name="notification_preference">{self.notification_options(sponsor["notification_preference"])}</select></label>
+          <p class="hint">Use international format for SMS, like +16055551234. Only send texts to sponsors who have agreed to receive them.</p>
           <label>New password <input name="password" placeholder="Leave blank to keep current password"></label>
           <p class="hint">Use "Send password link" on the sponsor list when you want the sponsor to set their own password by email.</p>
           <fieldset><legend>Linked students</legend>{options or '<p class="muted">Add students first.</p>'}</fieldset>
@@ -1105,16 +1176,23 @@ class App(BaseHTTPRequestHandler):
         form = self.form_fields()
         name = self.val(form, "name")
         email = self.val(form, "email").lower()
+        phone = self.val(form, "phone")
+        notification_preference = self.val(form, "notification_preference") or "email"
         password = self.val(form, "password")
         student_ids = [int(student_id) for student_id in self.vals(form, "student_ids")]
         if not name or not email:
             return self.sponsor_edit_get(sponsor_id, "Please add the sponsor name and email.")
+        if notification_preference not in ("email", "sms", "email_sms"):
+            return self.sponsor_edit_get(sponsor_id, "Please choose a valid notification preference.")
         try:
             with db() as conn:
                 sponsor = conn.execute("SELECT * FROM sponsors WHERE id=?", (sponsor_id,)).fetchone()
                 if not sponsor:
                     return self.not_found()
-                conn.execute("UPDATE sponsors SET name=?, email=? WHERE id=?", (name, email, sponsor_id))
+                conn.execute(
+                    "UPDATE sponsors SET name=?, email=?, phone=?, notification_preference=? WHERE id=?",
+                    (name, email, phone, notification_preference, sponsor_id),
+                )
                 if sponsor["user_id"]:
                     conn.execute("UPDATE users SET name=?, email=? WHERE id=?", (name, email, sponsor["user_id"]))
                     if password:
@@ -1144,6 +1222,7 @@ class App(BaseHTTPRequestHandler):
                 if sponsor["user_id"]:
                     conn.execute("DELETE FROM password_tokens WHERE user_id=?", (sponsor["user_id"],))
                 conn.execute("DELETE FROM email_notifications WHERE sponsor_id=?", (sponsor_id,))
+                conn.execute("DELETE FROM sms_notifications WHERE sponsor_id=?", (sponsor_id,))
                 conn.execute("DELETE FROM sponsor_students WHERE sponsor_id=?", (sponsor_id,))
                 conn.execute("DELETE FROM sponsors WHERE id=?", (sponsor_id,))
                 if sponsor["user_id"]:
@@ -1276,6 +1355,7 @@ class App(BaseHTTPRequestHandler):
                 raise PermissionError()
             files = conn.execute("SELECT * FROM update_files WHERE update_id=? ORDER BY kind, original_name", (update_id,)).fetchall()
             notifications = conn.execute("SELECT * FROM email_notifications WHERE update_id=? ORDER BY sent_at DESC", (update_id,)).fetchall() if self.user["role"] == "admin" else []
+            sms_notifications = conn.execute("SELECT * FROM sms_notifications WHERE update_id=? ORDER BY sent_at DESC", (update_id,)).fetchall() if self.user["role"] == "admin" else []
         actions = ""
         if self.user["role"] in ("admin", "staff") and update["status"] == "draft":
             actions += f'<form method="post" action="/updates/{update_id}/submit"><button class="primary">Submit for admin review</button></form>'
@@ -1293,6 +1373,16 @@ class App(BaseHTTPRequestHandler):
             <section class="panel">
               <h2>Email notifications</h2>
               <div class="tablewrap"><table><thead><tr><th>Recipient</th><th>Status</th><th>Message</th><th>Time</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="5">No email notifications yet.</td></tr>'}</tbody></table></div>
+            </section>
+            """
+            sms_rows = "".join(
+                f'<tr><td>{escape(n["recipient_phone"])}</td><td><span class="pill">{escape(n["status"])}</span></td><td>{escape(n["provider_message"] or "")}</td><td>{escape((n["attempted_at"] or n["sent_at"])[:19])}</td><td>{self.sms_retry_button(n)}</td></tr>'
+                for n in sms_notifications
+            )
+            email_log += f"""
+            <section class="panel">
+              <h2>SMS notifications</h2>
+              <div class="tablewrap"><table><thead><tr><th>Recipient</th><th>Status</th><th>Message</th><th>Time</th><th></th></tr></thead><tbody>{sms_rows or '<tr><td colspan="5">No SMS notifications yet.</td></tr>'}</tbody></table></div>
             </section>
             """
         body = f"""
@@ -1320,6 +1410,24 @@ class App(BaseHTTPRequestHandler):
             status, provider_message = send_email(notification["recipient_email"], notification["subject"], notification["body"])
             conn.execute(
                 "UPDATE email_notifications SET status=?, provider_message=?, attempted_at=?, sent_at=? WHERE id=?",
+                (status, provider_message, now(), now(), notification_id),
+            )
+            return self.redirect(f"/updates/{notification['update_id']}")
+
+    def sms_retry_button(self, notification):
+        if notification["status"] == "sent":
+            return ""
+        return f'<form method="post" action="/sms/{notification["id"]}/retry"><button>Retry</button></form>'
+
+    def sms_retry(self, notification_id):
+        self.require_roles("admin")
+        with db() as conn:
+            notification = conn.execute("SELECT * FROM sms_notifications WHERE id=?", (notification_id,)).fetchone()
+            if not notification:
+                return self.not_found()
+            status, provider_message = send_sms(notification["recipient_phone"], notification["body"])
+            conn.execute(
+                "UPDATE sms_notifications SET status=?, provider_message=?, attempted_at=?, sent_at=? WHERE id=?",
                 (status, provider_message, now(), now(), notification_id),
             )
             return self.redirect(f"/updates/{notification['update_id']}")
@@ -1362,20 +1470,30 @@ class App(BaseHTTPRequestHandler):
             (update["student_id"],),
         ).fetchall()
         for sponsor in sponsors:
-            subject = f"New Mission-Haiti update for {update['student_name']}"
-            body = (
-                f"Hello {sponsor['name']},\n\n"
-                f"A new approved Mission-Haiti update is available for {update['student_name']}.\n\n"
-                f"View it in your secure sponsor portal:\n"
-                f"{APP_BASE_URL}/portal/students/{update['student_id']}\n\n"
-                "For privacy, please do not forward this link. You will need to sign in to view the update.\n\n"
-                "Mission-Haiti"
-            )
-            status, provider_message = send_email(sponsor["email"], subject, body)
-            conn.execute(
-                "INSERT INTO email_notifications (update_id,sponsor_id,recipient_email,subject,body,sent_at,status,provider_message,attempted_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (update["id"], sponsor["id"], sponsor["email"], subject, body, now(), status, provider_message, now()),
-            )
+            portal_link = f"{APP_BASE_URL}/portal/students/{update['student_id']}"
+            preference = sponsor["notification_preference"] or "email"
+            if preference in ("email", "email_sms"):
+                subject = f"New Mission-Haiti update for {update['student_name']}"
+                body = (
+                    f"Hello {sponsor['name']},\n\n"
+                    f"A new approved Mission-Haiti update is available for {update['student_name']}.\n\n"
+                    f"View it in your secure sponsor portal:\n"
+                    f"{portal_link}\n\n"
+                    "For privacy, please do not forward this link. You will need to sign in to view the update.\n\n"
+                    "Mission-Haiti"
+                )
+                status, provider_message = send_email(sponsor["email"], subject, body)
+                conn.execute(
+                    "INSERT INTO email_notifications (update_id,sponsor_id,recipient_email,subject,body,sent_at,status,provider_message,attempted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (update["id"], sponsor["id"], sponsor["email"], subject, body, now(), status, provider_message, now()),
+                )
+            if preference in ("sms", "email_sms"):
+                sms_body = f"Mission-Haiti: A new student update is available. Sign in securely: {portal_link}"
+                status, provider_message = send_sms(sponsor["phone"] or "", sms_body)
+                conn.execute(
+                    "INSERT INTO sms_notifications (update_id,sponsor_id,recipient_phone,body,sent_at,status,provider_message,attempted_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (update["id"], sponsor["id"], sponsor["phone"] or "", sms_body, now(), status, provider_message, now()),
+                )
 
     def portal_student(self, student_id):
         if not self.sponsor_can_view_student(student_id, approved_only=False):

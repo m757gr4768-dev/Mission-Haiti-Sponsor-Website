@@ -38,9 +38,15 @@ SMTP_USERNAME=your-postmark-token
 SMTP_PASSWORD=your-postmark-token
 SMTP_FROM_EMAIL=paul@mission-haiti.org
 SMTP_FROM_NAME=Mission-Haiti
+
+TWILIO_ACCOUNT_SID=your-twilio-account-sid
+TWILIO_AUTH_TOKEN=your-twilio-auth-token
+TWILIO_FROM_NUMBER=+16055551234
 ```
 
 Use the real deployed URL for `APP_BASE_URL`. If the domain is not ready yet, use the temporary HTTPS URL from the host first.
+
+SMS is optional. If the Twilio variables are blank or missing, SMS notifications are recorded as skipped and email notifications still work. Only enable SMS for sponsors who have agreed to receive texts, and store phone numbers in international format, such as `+16055551234`.
 
 ## Persistent Disk
 
@@ -70,3 +76,4 @@ After the app is deployed:
 4. Open the sponsor email on a phone or another computer.
 5. Confirm the link opens the live HTTPS site.
 6. Log in as the sponsor and confirm only linked students are visible.
+7. For sponsors set to SMS or Email + SMS, confirm an SMS notification is logged and delivered.
