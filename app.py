@@ -64,6 +64,13 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
 PASSWORD_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
 ROLES = {"admin": "Admin", "staff": "Haiti staff", "sponsor": "Sponsor"}
+PERMISSIONS = {
+    "manage_students": "Manage student records",
+    "manage_sponsors": "Manage sponsor records",
+    "create_updates": "Create and submit student updates",
+    "approve_updates": "Approve, resend, and retry notifications",
+    "manage_admins": "Manage admin and Haiti staff accounts",
+}
 FILE_KINDS = {
     "profile_photo": "Profile photo",
     "report_card": "Grades/report card",
@@ -223,6 +230,11 @@ def init_db():
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('admin','staff','sponsor')),
                 sponsor_id INTEGER,
+                can_manage_students INTEGER NOT NULL DEFAULT 0,
+                can_manage_sponsors INTEGER NOT NULL DEFAULT 0,
+                can_create_updates INTEGER NOT NULL DEFAULT 0,
+                can_approve_updates INTEGER NOT NULL DEFAULT 0,
+                can_manage_admins INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS update_files (
@@ -322,6 +334,35 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_password_tokens_hash ON password_tokens(token_hash);
             """
         )
+        existing_user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        permission_defaults = {
+            "can_manage_students": 0,
+            "can_manage_sponsors": 0,
+            "can_create_updates": 0,
+            "can_approve_updates": 0,
+            "can_manage_admins": 0,
+        }
+        added_permission_columns = False
+        for column, default in permission_defaults.items():
+            if column not in existing_user_columns:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default}")
+                added_permission_columns = True
+        if added_permission_columns:
+            conn.execute(
+                """UPDATE users
+                   SET can_manage_students=1, can_manage_sponsors=1, can_create_updates=1,
+                       can_approve_updates=1, can_manage_admins=1
+                   WHERE role='admin'
+                     AND can_manage_students=0 AND can_manage_sponsors=0 AND can_create_updates=0
+                     AND can_approve_updates=0 AND can_manage_admins=0"""
+            )
+            conn.execute(
+                """UPDATE users
+                   SET can_manage_students=1, can_create_updates=1
+                   WHERE role='staff'
+                     AND can_manage_students=0 AND can_manage_sponsors=0 AND can_create_updates=0
+                     AND can_approve_updates=0 AND can_manage_admins=0"""
+            )
         existing_email_columns = {row["name"] for row in conn.execute("PRAGMA table_info(email_notifications)").fetchall()}
         if "status" not in existing_email_columns:
             conn.execute("ALTER TABLE email_notifications ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'")
@@ -348,8 +389,18 @@ def init_db():
         staff_hash = hash_password("staff123")
         sponsor_hash = hash_password("sponsor123")
         ts = now()
-        conn.execute("INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)", ("Admin User", "admin@mission-haiti.local", admin_hash, "admin", ts))
-        conn.execute("INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)", ("Haiti Staff", "staff@mission-haiti.local", staff_hash, "staff", ts))
+        conn.execute(
+            """INSERT INTO users
+               (name,email,password_hash,role,can_manage_students,can_manage_sponsors,can_create_updates,can_approve_updates,can_manage_admins,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            ("Admin User", "admin@mission-haiti.local", admin_hash, "admin", 1, 1, 1, 1, 1, ts),
+        )
+        conn.execute(
+            """INSERT INTO users
+               (name,email,password_hash,role,can_manage_students,can_manage_sponsors,can_create_updates,can_approve_updates,can_manage_admins,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            ("Haiti Staff", "staff@mission-haiti.local", staff_hash, "staff", 1, 0, 1, 0, 0, ts),
+        )
         sponsor_user = conn.execute("INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)", ("Demo Sponsor", "sponsor@example.com", sponsor_hash, "sponsor", ts)).lastrowid
         student_id = conn.execute("INSERT INTO students (name,school,grade_level,active,created_at) VALUES (?,?,?,?,?)", ("Marie Joseph", "Mission-Haiti School", "Grade 5", 1, ts)).lastrowid
         sponsor_id = conn.execute("INSERT INTO sponsors (name,email,user_id,created_at) VALUES (?,?,?,?)", ("Demo Sponsor", "sponsor@example.com", sponsor_user, ts)).lastrowid
@@ -405,6 +456,8 @@ class App(BaseHTTPRequestHandler):
                 return self.redirect("/login")
             if self.path_only.startswith("/files/") and self.path_only.endswith("/delete") and method == "POST":
                 return self.file_delete_post(int(self.path_only.split("/")[-2]))
+            if self.path_only == "/account/password":
+                return self.account_password_get() if method == "GET" else self.account_password_post()
             if self.path_only in ("/", "/dashboard") and method == "GET":
                 return self.dashboard()
             if self.path_only == "/students" and method == "GET":
@@ -431,6 +484,13 @@ class App(BaseHTTPRequestHandler):
                 return self.sponsor_invite_post(int(self.path_only.split("/")[-2]))
             if self.path_only == "/admins" and method == "GET":
                 return self.admins_index()
+            if self.path_only == "/admins/new":
+                return self.admin_new_get() if method == "GET" else self.admin_new_post()
+            if self.path_only.startswith("/admins/") and self.path_only.endswith("/edit"):
+                admin_id = int(self.path_only.split("/")[-2])
+                return self.admin_edit_get(admin_id) if method == "GET" else self.admin_edit_post(admin_id)
+            if self.path_only.startswith("/admins/") and self.path_only.endswith("/invite") and method == "POST":
+                return self.admin_invite_post(int(self.path_only.split("/")[-2]))
             if self.path_only.startswith("/admins/") and self.path_only.endswith("/delete") and method == "POST":
                 return self.admin_delete_post(int(self.path_only.split("/")[-2]))
             if self.path_only == "/updates/new":
@@ -470,6 +530,48 @@ class App(BaseHTTPRequestHandler):
         if not self.user or self.user["role"] not in roles:
             raise PermissionError()
 
+    def has_permission(self, permission):
+        if not self.user:
+            return False
+        if self.user["role"] == "sponsor":
+            return False
+        column = f"can_{permission}"
+        return column in self.user.keys() and bool(self.user[column])
+
+    def require_permission(self, permission):
+        if not self.has_permission(permission):
+            raise PermissionError()
+
+    def permission_values(self, form, role):
+        if role == "sponsor":
+            return {permission: 0 for permission in PERMISSIONS}
+        values = {permission: 1 if self.val(form, f"can_{permission}") else 0 for permission in PERMISSIONS}
+        if role == "staff":
+            values["approve_updates"] = 0
+            values["manage_admins"] = 0
+        return values
+
+    def permission_summary(self, user):
+        labels = [label for permission, label in PERMISSIONS.items() if f"can_{permission}" in user.keys() and user[f"can_{permission}"]]
+        return ", ".join(labels) if labels else "No extra access"
+
+    def permission_checks(self, user=None, role="admin"):
+        checks = []
+        for permission, label in PERMISSIONS.items():
+            if role == "staff" and permission in ("approve_updates", "manage_admins"):
+                continue
+            checked = ""
+            if user is None:
+                defaults = {
+                    "admin": {"manage_students", "manage_sponsors", "create_updates", "approve_updates", "manage_admins"},
+                    "staff": {"manage_students", "create_updates"},
+                }
+                checked = "checked" if permission in defaults.get(role, set()) else ""
+            else:
+                checked = "checked" if user[f"can_{permission}"] else ""
+            checks.append(f'<label class="check"><input type="checkbox" name="can_{permission}" {checked}> {escape(label)}</label>')
+        return "".join(checks)
+
     def send_html(self, content, status=HTTPStatus.OK, extra_headers=None):
         body = content.encode()
         self.send_response(status)
@@ -499,6 +601,7 @@ class App(BaseHTTPRequestHandler):
               <div class="navlinks">
                 <a href="/dashboard">Dashboard</a>
                 {self.role_links()}
+                <a href="/account/password">Password</a>
                 <form method="post" action="/logout"><button class="linkbtn">Sign out</button></form>
               </div>
             </nav>
@@ -521,11 +624,14 @@ class App(BaseHTTPRequestHandler):
         role = self.user["role"]
         if role == "sponsor":
             return ""
-        links = ['<a href="/students">Students</a>']
-        if role == "admin":
+        links = []
+        if self.has_permission("manage_students"):
+            links.append('<a href="/students">Students</a>')
+        if self.has_permission("manage_sponsors"):
             links.append('<a href="/sponsors">Sponsors</a>')
+        if self.has_permission("manage_admins"):
             links.append('<a href="/admins">Admins</a>')
-        if role in ("admin", "staff"):
+        if self.has_permission("create_updates"):
             links.append('<a href="/updates/new">New update</a>')
         return "".join(links)
 
@@ -848,6 +954,35 @@ class App(BaseHTTPRequestHandler):
         self.send_header("Set-Cookie", session_cookie("", max_age=0))
         self.end_headers()
 
+    def account_password_get(self, message="", success=False):
+        body = f"""
+        <header class="pagehead"><div><p class="eyebrow">Account</p><h1>Change password</h1></div></header>
+        <form class="panel form" method="post" action="/account/password">
+          {f'<p class="{"notice" if success else "alert"}">{escape(message)}</p>' if message else ''}
+          <label>Current password <input required type="password" name="current_password" autocomplete="current-password"></label>
+          <label>New password <input required type="password" name="password" autocomplete="new-password" minlength="8"></label>
+          <label>Confirm new password <input required type="password" name="password_confirm" autocomplete="new-password" minlength="8"></label>
+          <button class="primary">Save password</button>
+        </form>
+        """
+        return self.send_html(self.layout("Change password", body))
+
+    def account_password_post(self):
+        form = self.form_fields()
+        current_password = self.val(form, "current_password")
+        password = self.val(form, "password")
+        password_confirm = self.val(form, "password_confirm")
+        if not verify_password(current_password, self.user["password_hash"]):
+            return self.account_password_get("The current password was not correct.")
+        if len(password) < 8:
+            return self.account_password_get("Please choose a password with at least 8 characters.")
+        if password != password_confirm:
+            return self.account_password_get("The password confirmation did not match.")
+        with db() as conn:
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(password), self.user["id"]))
+            conn.execute("UPDATE password_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL", (now(), self.user["id"]))
+        return self.account_password_get("Password updated.", success=True)
+
     def dashboard(self):
         if self.user["role"] == "sponsor":
             return self.sponsor_dashboard()
@@ -859,11 +994,13 @@ class App(BaseHTTPRequestHandler):
                 "sponsors": conn.execute("SELECT COUNT(*) FROM sponsors").fetchone()[0],
                 "approved": conn.execute("SELECT COUNT(*) FROM updates WHERE status='approved'").fetchone()[0],
             }
-        review = "".join(f'<li><a href="/updates/{u["id"]}">{escape(u["student_name"])} update</a> <span class="pill">{escape(u["status"])}</span></li>' for u in (pending if self.user["role"] == "admin" else drafts))
+        review_updates = pending if self.has_permission("approve_updates") else drafts
+        review = "".join(f'<li><a href="/updates/{u["id"]}">{escape(u["student_name"])} update</a> <span class="pill">{escape(u["status"])}</span></li>' for u in review_updates)
+        create_button = '<a class="button primary" href="/updates/new">Create update</a>' if self.has_permission("create_updates") else ""
         body = f"""
         <header class="pagehead">
           <div><p class="eyebrow">{escape(ROLES[self.user["role"]])}</p><h1>Dashboard</h1></div>
-          <a class="button primary" href="/updates/new">Create update</a>
+          {create_button}
         </header>
         <section class="mission-banner">
           <img src="/static/students-classroom.png" alt="">
@@ -879,7 +1016,7 @@ class App(BaseHTTPRequestHandler):
           <div><strong>{counts["approved"]}</strong><span>Approved updates</span></div>
         </section>
         <section class="panel">
-          <h2>{'Pending admin review' if self.user["role"] == "admin" else 'Drafts and submitted updates'}</h2>
+          <h2>{'Pending admin review' if self.has_permission("approve_updates") else 'Drafts and submitted updates'}</h2>
           <ul class="list">{review or '<li class="muted">No updates waiting right now.</li>'}</ul>
         </section>
         """
@@ -933,7 +1070,7 @@ class App(BaseHTTPRequestHandler):
         """
 
     def students_index(self):
-        self.require_roles("admin", "staff")
+        self.require_permission("manage_students")
         with db() as conn:
             students = conn.execute("SELECT * FROM students ORDER BY active DESC, name").fetchall()
         body = f"""
@@ -943,7 +1080,7 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout("Students", body))
 
     def student_new_get(self, message=""):
-        self.require_roles("admin", "staff")
+        self.require_permission("manage_students")
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Student records</p><h1>Add student</h1></div></header>
         <form class="panel form" method="post" enctype="multipart/form-data">
@@ -964,7 +1101,7 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout("Add student", body))
 
     def student_new_post(self):
-        self.require_roles("admin", "staff")
+        self.require_permission("manage_students")
         try:
             form = self.form_fields()
             name = self.val(form, "name")
@@ -989,7 +1126,8 @@ class App(BaseHTTPRequestHandler):
             return self.student_new_get(f"The student could not be saved: {exc}")
 
     def student_detail(self, student_id):
-        self.require_roles("admin", "staff")
+        if not (self.has_permission("manage_students") or self.has_permission("create_updates")):
+            raise PermissionError()
         with db() as conn:
             student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
             if not student:
@@ -1008,13 +1146,14 @@ class App(BaseHTTPRequestHandler):
             </form>
             """
         admin_actions = ""
-        if self.user["role"] == "admin":
+        if self.has_permission("manage_students"):
             admin_actions = f"""
             <a class="button" href="/students/{student_id}/edit">Edit student</a>
             <form method="post" action="/students/{student_id}/delete"><button class="danger">Remove student</button></form>
             """
+        update_action = f'<a class="button primary" href="/updates/new?student_id={student_id}">Create update</a>' if self.has_permission("create_updates") else ""
         body = f"""
-        <header class="pagehead"><div><p class="eyebrow">Student</p><h1>{escape(student["name"])}</h1></div><div class="actions">{admin_actions}<a class="button primary" href="/updates/new?student_id={student_id}">Create update</a></div></header>
+        <header class="pagehead"><div><p class="eyebrow">Student</p><h1>{escape(student["name"])}</h1></div><div class="actions">{admin_actions}{update_action}</div></header>
         <section class="detail">
           <div class="panel">{self.student_card(student)}{self.student_info_list(student)}{profile_remove}</div>
           <div class="panel"><h2>Sponsors</h2><ul class="list">{''.join(f'<li>{escape(s["name"])} · {escape(s["email"])}</li>' for s in sponsors) or '<li class="muted">No linked sponsors.</li>'}</ul></div>
@@ -1024,7 +1163,7 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout(student["name"], body))
 
     def student_edit_get(self, student_id, message=""):
-        self.require_roles("admin")
+        self.require_permission("manage_students")
         with db() as conn:
             student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
             if not student:
@@ -1054,7 +1193,7 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout("Edit student", body))
 
     def student_edit_post(self, student_id):
-        self.require_roles("admin")
+        self.require_permission("manage_students")
         try:
             form = self.form_fields()
             name = self.val(form, "name")
@@ -1097,7 +1236,7 @@ class App(BaseHTTPRequestHandler):
             return self.student_edit_get(student_id, f"The student could not be saved: {exc}")
 
     def student_delete_post(self, student_id):
-        self.require_roles("admin")
+        self.require_permission("manage_students")
         storage_names = []
         try:
             with db() as conn:
@@ -1124,7 +1263,7 @@ class App(BaseHTTPRequestHandler):
             return self.error_page(HTTPStatus.BAD_REQUEST, f"The student could not be removed: {exc}")
 
     def sponsors_index(self):
-        self.require_roles("admin")
+        self.require_permission("manage_sponsors")
         message = self.query.get("message", [""])[0]
         with db() as conn:
             sponsors = conn.execute("SELECT * FROM sponsors ORDER BY name").fetchall()
@@ -1151,7 +1290,7 @@ class App(BaseHTTPRequestHandler):
         return "".join(f'<option value="{value}" {"selected" if selected == value else ""}>{label}</option>' for value, label in options)
 
     def sponsor_new_get(self):
-        self.require_roles("admin")
+        self.require_permission("manage_sponsors")
         with db() as conn:
             students = conn.execute("SELECT * FROM students WHERE active=1 ORDER BY name").fetchall()
         options = "".join(f'<label class="check"><input type="checkbox" name="student_ids" value="{s["id"]}"> {escape(s["name"])}</label>' for s in students)
@@ -1171,7 +1310,7 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout("Add sponsor", body))
 
     def sponsor_new_post(self):
-        self.require_roles("admin")
+        self.require_permission("manage_sponsors")
         form = self.form_fields()
         name, email = self.val(form, "name"), self.val(form, "email").lower()
         phone = self.val(form, "phone")
@@ -1207,7 +1346,7 @@ class App(BaseHTTPRequestHandler):
             return self.error_page(HTTPStatus.BAD_REQUEST, f"The sponsor could not be saved: {exc}")
 
     def sponsor_edit_get(self, sponsor_id, message=""):
-        self.require_roles("admin")
+        self.require_permission("manage_sponsors")
         with db() as conn:
             sponsor = conn.execute("SELECT * FROM sponsors WHERE id=?", (sponsor_id,)).fetchone()
             if not sponsor:
@@ -1236,7 +1375,7 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout("Edit sponsor", body))
 
     def sponsor_edit_post(self, sponsor_id):
-        self.require_roles("admin")
+        self.require_permission("manage_sponsors")
         form = self.form_fields()
         name = self.val(form, "name")
         email = self.val(form, "email").lower()
@@ -1277,7 +1416,7 @@ class App(BaseHTTPRequestHandler):
             return self.sponsor_edit_get(sponsor_id, f"The sponsor could not be saved: {exc}")
 
     def sponsor_delete_post(self, sponsor_id):
-        self.require_roles("admin")
+        self.require_permission("manage_sponsors")
         try:
             with db() as conn:
                 sponsor = conn.execute("SELECT * FROM sponsors WHERE id=?", (sponsor_id,)).fetchone()
@@ -1296,7 +1435,7 @@ class App(BaseHTTPRequestHandler):
             return self.error_page(HTTPStatus.BAD_REQUEST, f"The sponsor could not be removed: {exc}")
 
     def sponsor_invite_post(self, sponsor_id):
-        self.require_roles("admin")
+        self.require_permission("manage_sponsors")
         try:
             with db() as conn:
                 sponsor = conn.execute("SELECT * FROM sponsors WHERE id=?", (sponsor_id,)).fetchone()
@@ -1318,27 +1457,177 @@ class App(BaseHTTPRequestHandler):
             return self.error_page(HTTPStatus.BAD_REQUEST, f"The password link could not be sent: {exc}")
 
     def admins_index(self):
-        self.require_roles("admin")
+        self.require_permission("manage_admins")
+        message = self.query.get("message", [""])[0]
         with db() as conn:
             users = conn.execute("SELECT * FROM users WHERE role IN ('admin','staff') ORDER BY role, name").fetchall()
             admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
         rows = ""
         for user in users:
-            action = '<span class="muted">Current user</span>' if user["id"] == self.user["id"] else ""
-            if not action:
+            actions = [f'<a class="button" href="/admins/{user["id"]}/edit">Edit</a>']
+            if user["id"] == self.user["id"]:
+                actions.append('<span class="muted">Current user</span>')
+            else:
+                actions.append(f'<form method="post" action="/admins/{user["id"]}/invite"><button>Send password link</button></form>')
                 if user["role"] == "admin" and admin_count <= 1:
-                    action = '<span class="muted">Last admin</span>'
+                    actions.append('<span class="muted">Last admin</span>')
                 else:
-                    action = f'<form method="post" action="/admins/{user["id"]}/delete"><button class="danger">Remove</button></form>'
-            rows += f'<tr><td>{escape(user["name"])}</td><td>{escape(user["email"])}</td><td>{escape(ROLES[user["role"]])}</td><td>{action}</td></tr>'
+                    actions.append(f'<form method="post" action="/admins/{user["id"]}/delete"><button class="danger">Remove</button></form>')
+            rows += f'<tr><td>{escape(user["name"])}</td><td>{escape(user["email"])}</td><td>{escape(ROLES[user["role"]])}</td><td>{escape(self.permission_summary(user))}</td><td><div class="actions">{"".join(actions)}</div></td></tr>'
         body = f"""
-        <header class="pagehead"><div><p class="eyebrow">Admin</p><h1>Admins</h1></div></header>
-        <div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="4">No admin users found.</td></tr>'}</tbody></table></div>
+        <header class="pagehead"><div><p class="eyebrow">Admin</p><h1>Admins and Haiti staff</h1></div><a class="button primary" href="/admins/new">Add admin/staff</a></header>
+        {f'<p class="notice">{escape(message)}</p>' if message else ''}
+        <div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Allowed functions</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="5">No admin users found.</td></tr>'}</tbody></table></div>
         """
         return self.send_html(self.layout("Admins", body))
 
+    def admin_new_get(self, message=""):
+        self.require_permission("manage_admins")
+        body = f"""
+        <header class="pagehead"><div><p class="eyebrow">Admin</p><h1>Add admin/staff</h1></div><a class="button" href="/admins">Back to admins</a></header>
+        <form class="panel form" method="post">
+          {f'<p class="alert">{escape(message)}</p>' if message else ''}
+          <label>Name <input required name="name"></label>
+          <label>Email <input required type="email" name="email"></label>
+          <label>Role <select name="role"><option value="admin">Admin</option><option value="staff">Haiti staff</option></select></label>
+          <label>Temporary password <input name="password" placeholder="Leave blank to email setup link"></label>
+          <label class="check"><input type="checkbox" name="send_invite" checked> Email this user a secure password setup link</label>
+          <fieldset><legend>Allowed functions</legend>{self.permission_checks(role="admin")}</fieldset>
+          <p class="hint">Haiti staff cannot approve updates or manage admin accounts.</p>
+          <button class="primary">Save account</button>
+        </form>
+        """
+        return self.send_html(self.layout("Add admin", body))
+
+    def admin_new_post(self):
+        self.require_permission("manage_admins")
+        form = self.form_fields()
+        name = self.val(form, "name")
+        email = self.val(form, "email").lower()
+        role = self.val(form, "role") or "staff"
+        password = self.val(form, "password")
+        send_invite = bool(self.val(form, "send_invite"))
+        if role not in ("admin", "staff"):
+            return self.admin_new_get("Please choose Admin or Haiti staff.")
+        if not name or not email:
+            return self.admin_new_get("Please add a name and email.")
+        permissions = self.permission_values(form, role)
+        try:
+            with db() as conn:
+                user_id = conn.execute(
+                    """INSERT INTO users
+                       (name,email,password_hash,role,can_manage_students,can_manage_sponsors,can_create_updates,can_approve_updates,can_manage_admins,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        name,
+                        email,
+                        hash_password(password or secrets.token_urlsafe(32)),
+                        role,
+                        permissions["manage_students"],
+                        permissions["manage_sponsors"],
+                        permissions["create_updates"],
+                        permissions["approve_updates"],
+                        permissions["manage_admins"],
+                        now(),
+                    ),
+                ).lastrowid
+                user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+                message = "Account saved."
+                if send_invite:
+                    status, provider_message = self.send_password_link(conn, user, "invite")
+                    message = f"Account saved. Password setup email {status}: {provider_message}"
+            return self.redirect(f"/admins?message={urllib.parse.quote(message)}")
+        except sqlite3.IntegrityError:
+            return self.admin_new_get("That email is already being used by another account.")
+        except sqlite3.Error as exc:
+            return self.admin_new_get(f"The account could not be saved: {exc}")
+
+    def admin_edit_get(self, user_id, message=""):
+        self.require_permission("manage_admins")
+        with db() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id=? AND role IN ('admin','staff')", (user_id,)).fetchone()
+            if not user:
+                return self.not_found()
+            admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
+        role_options = "".join(
+            f'<option value="{value}" {"selected" if user["role"] == value else ""}>{escape(label)}</option>'
+            for value, label in (("admin", "Admin"), ("staff", "Haiti staff"))
+        )
+        role_disabled = "disabled" if user["role"] == "admin" and admin_count <= 1 else ""
+        body = f"""
+        <header class="pagehead"><div><p class="eyebrow">Admin</p><h1>Edit admin/staff</h1></div><a class="button" href="/admins">Back to admins</a></header>
+        <form class="panel form" method="post">
+          {f'<p class="alert">{escape(message)}</p>' if message else ''}
+          <label>Name <input required name="name" value="{escape(user["name"])}"></label>
+          <label>Email <input required type="email" name="email" value="{escape(user["email"])}"></label>
+          <label>Role <select name="role" {role_disabled}>{role_options}</select></label>
+          <label>New password <input name="password" placeholder="Leave blank to keep current password"></label>
+          <fieldset><legend>Allowed functions</legend>{self.permission_checks(user, user["role"])}</fieldset>
+          <p class="hint">Use Send password link on the admin list when you want this user to set their own password by email.</p>
+          <button class="primary">Save changes</button>
+        </form>
+        """
+        return self.send_html(self.layout("Edit admin", body))
+
+    def admin_edit_post(self, user_id):
+        self.require_permission("manage_admins")
+        form = self.form_fields()
+        name = self.val(form, "name")
+        email = self.val(form, "email").lower()
+        password = self.val(form, "password")
+        try:
+            with db() as conn:
+                user = conn.execute("SELECT * FROM users WHERE id=? AND role IN ('admin','staff')", (user_id,)).fetchone()
+                if not user:
+                    return self.not_found()
+                admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
+                role = self.val(form, "role") or user["role"]
+                if user["role"] == "admin" and admin_count <= 1:
+                    role = "admin"
+                if role not in ("admin", "staff"):
+                    return self.admin_edit_get(user_id, "Please choose Admin or Haiti staff.")
+                if user_id == self.user["id"] and role != "admin":
+                    return self.admin_edit_get(user_id, "You cannot change your own account away from Admin.")
+                permissions = self.permission_values(form, role)
+                if user_id == self.user["id"]:
+                    permissions["manage_admins"] = 1
+                conn.execute(
+                    """UPDATE users
+                       SET name=?, email=?, role=?, can_manage_students=?, can_manage_sponsors=?,
+                           can_create_updates=?, can_approve_updates=?, can_manage_admins=?
+                       WHERE id=?""",
+                    (
+                        name,
+                        email,
+                        role,
+                        permissions["manage_students"],
+                        permissions["manage_sponsors"],
+                        permissions["create_updates"],
+                        permissions["approve_updates"],
+                        permissions["manage_admins"],
+                        user_id,
+                    ),
+                )
+                if password:
+                    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(password), user_id))
+            return self.redirect("/admins")
+        except sqlite3.IntegrityError:
+            return self.admin_edit_get(user_id, "That email is already being used by another account.")
+        except sqlite3.Error as exc:
+            return self.admin_edit_get(user_id, f"The account could not be saved: {exc}")
+
+    def admin_invite_post(self, user_id):
+        self.require_permission("manage_admins")
+        with db() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id=? AND role IN ('admin','staff')", (user_id,)).fetchone()
+            if not user:
+                return self.not_found()
+            status, provider_message = self.send_password_link(conn, user, "reset")
+        message = f"Password email {status}: {provider_message}"
+        return self.redirect(f"/admins?message={urllib.parse.quote(message)}")
+
     def admin_delete_post(self, user_id):
-        self.require_roles("admin")
+        self.require_permission("manage_admins")
         if user_id == self.user["id"]:
             return self.error_page(HTTPStatus.BAD_REQUEST, "You cannot remove the account you are currently using.")
         try:
@@ -1358,7 +1647,7 @@ class App(BaseHTTPRequestHandler):
             return self.error_page(HTTPStatus.BAD_REQUEST, f"The admin account could not be removed: {exc}")
 
     def update_new_get(self, message=""):
-        self.require_roles("admin", "staff")
+        self.require_permission("create_updates")
         selected = self.query.get("student_id", [""])[0]
         with db() as conn:
             students = conn.execute("SELECT * FROM students WHERE active=1 ORDER BY name").fetchall()
@@ -1378,7 +1667,7 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout("Create update", body))
 
     def update_new_post(self):
-        self.require_roles("admin", "staff")
+        self.require_permission("create_updates")
         try:
             form = self.form_fields()
             student_id = int(self.val(form, "student_id"))
@@ -1418,17 +1707,17 @@ class App(BaseHTTPRequestHandler):
             if self.user["role"] == "sponsor" and not self.sponsor_can_view_student(update["student_id"], approved_only=True):
                 raise PermissionError()
             files = conn.execute("SELECT * FROM update_files WHERE update_id=? ORDER BY kind, original_name", (update_id,)).fetchall()
-            notifications = conn.execute("SELECT * FROM email_notifications WHERE update_id=? ORDER BY sent_at DESC", (update_id,)).fetchall() if self.user["role"] == "admin" else []
-            sms_notifications = conn.execute("SELECT * FROM sms_notifications WHERE update_id=? ORDER BY sent_at DESC", (update_id,)).fetchall() if self.user["role"] == "admin" else []
+            notifications = conn.execute("SELECT * FROM email_notifications WHERE update_id=? ORDER BY sent_at DESC", (update_id,)).fetchall() if self.has_permission("approve_updates") else []
+            sms_notifications = conn.execute("SELECT * FROM sms_notifications WHERE update_id=? ORDER BY sent_at DESC", (update_id,)).fetchall() if self.has_permission("approve_updates") else []
         actions = ""
-        if self.user["role"] in ("admin", "staff") and update["status"] == "draft":
+        if self.has_permission("create_updates") and update["status"] == "draft":
             actions += f'<form method="post" action="/updates/{update_id}/submit"><button class="primary">Submit for admin review</button></form>'
-        if self.user["role"] == "admin" and update["status"] == "pending":
+        if self.has_permission("approve_updates") and update["status"] == "pending":
             actions += f'<form method="post" action="/updates/{update_id}/approve"><button class="primary">Approve and notify sponsors</button></form>'
-        if self.user["role"] == "admin" and update["status"] == "approved":
+        if self.has_permission("approve_updates") and update["status"] == "approved":
             actions += f'<form method="post" action="/updates/{update_id}/resend"><button class="primary">Resend to sponsors</button></form>'
         email_log = ""
-        if self.user["role"] == "admin":
+        if self.has_permission("approve_updates"):
             rows = "".join(
                 f'<tr><td>{escape(n["recipient_email"])}</td><td><span class="pill">{escape(n["status"])}</span></td><td>{escape(n["provider_message"] or "")}</td><td>{escape((n["attempted_at"] or n["sent_at"])[:19])}</td><td>{self.email_retry_button(n)}</td></tr>'
                 for n in notifications
@@ -1466,7 +1755,7 @@ class App(BaseHTTPRequestHandler):
         return f'<form method="post" action="/emails/{notification["id"]}/retry"><button>Retry</button></form>'
 
     def email_retry(self, notification_id):
-        self.require_roles("admin")
+        self.require_permission("approve_updates")
         with db() as conn:
             notification = conn.execute("SELECT * FROM email_notifications WHERE id=?", (notification_id,)).fetchone()
             if not notification:
@@ -1484,7 +1773,7 @@ class App(BaseHTTPRequestHandler):
         return f'<form method="post" action="/sms/{notification["id"]}/retry"><button>Retry</button></form>'
 
     def sms_retry(self, notification_id):
-        self.require_roles("admin")
+        self.require_permission("approve_updates")
         with db() as conn:
             notification = conn.execute("SELECT * FROM sms_notifications WHERE id=?", (notification_id,)).fetchone()
             if not notification:
@@ -1497,18 +1786,18 @@ class App(BaseHTTPRequestHandler):
             return self.redirect(f"/updates/{notification['update_id']}")
 
     def update_submit(self, update_id):
-        self.require_roles("admin", "staff")
+        self.require_permission("create_updates")
         with db() as conn:
             update = conn.execute("SELECT * FROM updates WHERE id=?", (update_id,)).fetchone()
             if not update:
                 return self.not_found()
-            if self.user["role"] == "staff" and update["created_by"] != self.user["id"]:
+            if not self.has_permission("approve_updates") and update["created_by"] != self.user["id"]:
                 raise PermissionError()
             conn.execute("UPDATE updates SET status='pending', submitted_at=? WHERE id=?", (now(), update_id))
         return self.redirect(f"/updates/{update_id}")
 
     def update_approve(self, update_id):
-        self.require_roles("admin")
+        self.require_permission("approve_updates")
         with db() as conn:
             update = conn.execute("SELECT u.*, s.name student_name FROM updates u JOIN students s ON s.id=u.student_id WHERE u.id=?", (update_id,)).fetchone()
             if not update:
@@ -1518,7 +1807,7 @@ class App(BaseHTTPRequestHandler):
         return self.redirect(f"/updates/{update_id}")
 
     def update_resend(self, update_id):
-        self.require_roles("admin")
+        self.require_permission("approve_updates")
         with db() as conn:
             update = conn.execute("SELECT u.*, s.name student_name FROM updates u JOIN students s ON s.id=u.student_id WHERE u.id=?", (update_id,)).fetchone()
             if not update:
@@ -1609,7 +1898,7 @@ class App(BaseHTTPRequestHandler):
             else:
                 preview = '<div class="fileicon">FILE</div>'
             remove = ""
-            if self.user and self.user["role"] in ("admin", "staff"):
+            if self.user and (self.has_permission("create_updates") or self.has_permission("approve_updates")):
                 remove = f"""
                 <form method="post" action="/files/{f["id"]}/delete">
                   <button class="danger">Remove</button>
@@ -1634,7 +1923,7 @@ class App(BaseHTTPRequestHandler):
             file = conn.execute("SELECT * FROM update_files WHERE id=?", (file_id,)).fetchone()
             if not file:
                 return self.not_found()
-            allowed = self.user["role"] in ("admin", "staff")
+            allowed = self.has_permission("manage_students") or self.has_permission("create_updates") or self.has_permission("approve_updates")
             if self.user["role"] == "sponsor":
                 if file["kind"] == "profile_photo":
                     allowed = bool(conn.execute("SELECT 1 FROM sponsor_students ss JOIN students st ON st.id=ss.student_id WHERE ss.sponsor_id=? AND st.profile_photo_file_id=?", (self.user["sponsor_id"], file_id)).fetchone())
@@ -1661,7 +1950,8 @@ class App(BaseHTTPRequestHandler):
             shutil.copyfileobj(src, self.wfile)
 
     def file_delete_post(self, file_id):
-        self.require_roles("admin", "staff")
+        if not (self.has_permission("create_updates") or self.has_permission("approve_updates")):
+            raise PermissionError()
         with db() as conn:
             file = conn.execute("SELECT * FROM update_files WHERE id=?", (file_id,)).fetchone()
             if not file:
