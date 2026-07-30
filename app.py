@@ -385,6 +385,10 @@ class App(BaseHTTPRequestHandler):
         try:
             if self.path_only.startswith("/static/") and method == "GET":
                 return self.static_file(self.path_only.removeprefix("/static/"))
+            if self.path_only == "/privacy" and method == "GET":
+                return self.privacy_page()
+            if self.path_only == "/terms" and method == "GET":
+                return self.terms_page()
             if self.path_only == "/login":
                 return self.login_get() if method == "GET" else self.login_post()
             if self.path_only == "/forgot-password":
@@ -522,6 +526,49 @@ class App(BaseHTTPRequestHandler):
         if role in ("admin", "staff"):
             links.append('<a href="/updates/new">New update</a>')
         return "".join(links)
+
+    def public_page(self, title, body):
+        return f"""<!doctype html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>{escape(title)} - Mission-Haiti</title>
+          <link rel="stylesheet" href="/static/styles.css">
+        </head>
+        <body>
+          <main class="shell legal">
+            <p><a href="/login">Mission-Haiti sponsor portal</a></p>
+            {body}
+          </main>
+        </body>
+        </html>"""
+
+    def privacy_page(self):
+        body = """
+        <section class="panel legalcopy">
+          <h1>Privacy Policy</h1>
+          <p>Mission-Haiti uses the sponsor portal to share secure student updates with authorized sponsors.</p>
+          <p>We collect sponsor contact information, including email addresses and mobile phone numbers, so we can notify sponsors when a new student update is available. Student updates are only available after signing in to the secure portal.</p>
+          <p>Mobile phone numbers are used only for Mission-Haiti sponsor update notifications and related account messages. Mobile numbers and SMS opt-in information are not sold, rented, or shared with third parties for marketing or promotional purposes.</p>
+          <p>Message frequency varies based on when student updates are approved. Message and data rates may apply. Sponsors may reply STOP to opt out of SMS notifications or HELP for help.</p>
+          <p>Questions about this policy can be sent to <a href="mailto:paul@mission-haiti.org">paul@mission-haiti.org</a>.</p>
+        </section>
+        """
+        return self.send_html(self.public_page("Privacy Policy", body))
+
+    def terms_page(self):
+        body = """
+        <section class="panel legalcopy">
+          <h1>SMS Terms and Conditions</h1>
+          <p>Mission-Haiti sends SMS notifications to sponsors who choose to receive text alerts about new approved student updates in the secure sponsor portal.</p>
+          <p>By providing a mobile phone number and choosing SMS notifications, you agree to receive recurring text messages from Mission-Haiti. Message frequency varies based on update activity.</p>
+          <p>Message and data rates may apply. Reply STOP to cancel SMS notifications. Reply HELP for help. You can also contact <a href="mailto:paul@mission-haiti.org">paul@mission-haiti.org</a>.</p>
+          <p>SMS notifications do not contain private student details. They direct sponsors to sign in to the secure portal before viewing updates.</p>
+          <p>Carriers are not liable for delayed or undelivered messages.</p>
+        </section>
+        """
+        return self.send_html(self.public_page("SMS Terms", body))
 
     def form_fields(self):
         content_type = self.headers.get("Content-Type", "")
