@@ -215,6 +215,9 @@ def init_db():
                 name TEXT NOT NULL,
                 school TEXT NOT NULL,
                 grade_level TEXT NOT NULL,
+                age INTEGER,
+                birthdate TEXT,
+                sex TEXT,
                 profile_photo_file_id INTEGER,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
@@ -283,6 +286,13 @@ def init_db():
             conn.execute("ALTER TABLE email_notifications ADD COLUMN provider_message TEXT")
         if "attempted_at" not in existing_email_columns:
             conn.execute("ALTER TABLE email_notifications ADD COLUMN attempted_at TEXT")
+        existing_student_columns = {row["name"] for row in conn.execute("PRAGMA table_info(students)").fetchall()}
+        if "age" not in existing_student_columns:
+            conn.execute("ALTER TABLE students ADD COLUMN age INTEGER")
+        if "birthdate" not in existing_student_columns:
+            conn.execute("ALTER TABLE students ADD COLUMN birthdate TEXT")
+        if "sex" not in existing_student_columns:
+            conn.execute("ALTER TABLE students ADD COLUMN sex TEXT")
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count:
             return
@@ -508,6 +518,17 @@ class App(BaseHTTPRequestHandler):
             fields = form[name] if isinstance(form[name], list) else [form[name]]
             return [f.value for f in fields if not f.filename and f.value]
         return form.get(name, [])
+
+    def optional_int(self, value, label):
+        if not value:
+            return None
+        try:
+            number = int(value)
+        except ValueError:
+            raise ValueError(f"{label} must be a whole number.")
+        if number < 0:
+            raise ValueError(f"{label} cannot be negative.")
+        return number
 
     def save_file(self, field, kind, uploaded_by, update_id=None):
         if field is None or not getattr(field, "filename", ""):
@@ -777,11 +798,24 @@ class App(BaseHTTPRequestHandler):
         url = f"/portal/students/{student['id']}" if portal else f"/students/{student['id']}"
         photo = f'<img alt="" src="/files/{student["profile_photo_file_id"]}">' if student["profile_photo_file_id"] else '<div class="avatar">MH</div>'
         status = "Active" if student["active"] else "Inactive"
+        age = f' · Age {escape(student["age"])}' if "age" in student.keys() and student["age"] is not None else ""
         return f"""
         <a class="card" href="{url}">
           {photo}
-          <div><h3>{escape(student["name"])}</h3><p>{escape(student["school"])} · {escape(student["grade_level"])}</p><span class="pill">{status}</span></div>
+          <div><h3>{escape(student["name"])}</h3><p>{escape(student["school"])} · {escape(student["grade_level"])}{age}</p><span class="pill">{status}</span></div>
         </a>
+        """
+
+    def student_info_list(self, student):
+        birthdate = student["birthdate"] or "Not listed"
+        age = student["age"] if student["age"] is not None else "Not listed"
+        sex = student["sex"] or "Not listed"
+        return f"""
+        <p><b>School:</b> {escape(student["school"])}</p>
+        <p><b>Grade:</b> {escape(student["grade_level"])}</p>
+        <p><b>Age:</b> {escape(age)}</p>
+        <p><b>Birthdate:</b> {escape(birthdate)}</p>
+        <p><b>Sex:</b> {escape(sex)}</p>
         """
 
     def students_index(self):
@@ -804,6 +838,9 @@ class App(BaseHTTPRequestHandler):
           <label>Name <input required name="name" placeholder="Student name"></label>
           <label>School <input required name="school" placeholder="School name"></label>
           <label>Grade level <input required name="grade_level" placeholder="Example: Grade 4"></label>
+          <label>Age <input type="number" min="0" max="30" name="age" placeholder="Example: 11"></label>
+          <label>Birthdate <input type="date" name="birthdate"></label>
+          <label>Sex <select name="sex"><option value="">Choose one</option><option>Female</option><option>Male</option></select></label>
           <label>Profile photo <input type="file" name="profile_photo" accept=".jpg,.jpeg,.png,image/jpeg,image/png"></label>
           <p class="hint">JPG, JPEG, or PNG photos up to 75 MB.</p>
           <label class="check"><input type="checkbox" name="active" checked> Active</label>
@@ -819,14 +856,17 @@ class App(BaseHTTPRequestHandler):
             name = self.val(form, "name")
             school = self.val(form, "school")
             grade_level = self.val(form, "grade_level")
+            age = self.optional_int(self.val(form, "age"), "Age")
+            birthdate = self.val(form, "birthdate")
+            sex = self.val(form, "sex")
             if not name or not school or not grade_level:
                 return self.student_new_get("Please fill in the student name, school, and grade level.")
             photo_field = form["profile_photo"] if isinstance(form, MultipartForm) and "profile_photo" in form else None
             photo_id = self.save_file(photo_field, "profile_photo", self.user["id"])
             with db() as conn:
                 student_id = conn.execute(
-                    "INSERT INTO students (name,school,grade_level,profile_photo_file_id,active,created_at) VALUES (?,?,?,?,?,?)",
-                    (name, school, grade_level, photo_id, 1 if self.val(form, "active") else 0, now()),
+                    "INSERT INTO students (name,school,grade_level,age,birthdate,sex,profile_photo_file_id,active,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (name, school, grade_level, age, birthdate, sex, photo_id, 1 if self.val(form, "active") else 0, now()),
                 ).lastrowid
             return self.redirect(f"/students/{student_id}")
         except ValueError as exc:
@@ -862,7 +902,7 @@ class App(BaseHTTPRequestHandler):
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Student</p><h1>{escape(student["name"])}</h1></div><div class="actions">{admin_actions}<a class="button primary" href="/updates/new?student_id={student_id}">Create update</a></div></header>
         <section class="detail">
-          <div class="panel">{self.student_card(student)}<p><b>School:</b> {escape(student["school"])}</p><p><b>Grade:</b> {escape(student["grade_level"])}</p>{profile_remove}</div>
+          <div class="panel">{self.student_card(student)}{self.student_info_list(student)}{profile_remove}</div>
           <div class="panel"><h2>Sponsors</h2><ul class="list">{''.join(f'<li>{escape(s["name"])} · {escape(s["email"])}</li>' for s in sponsors) or '<li class="muted">No linked sponsors.</li>'}</ul></div>
         </section>
         <section class="panel"><h2>Updates</h2><ul class="list">{''.join(f'<li><a href="/updates/{u["id"]}">{escape(u["created_at"][:10])} update</a> <span class="pill">{escape(u["status"])}</span></li>' for u in updates) or '<li class="muted">No updates yet.</li>'}</ul></section>
@@ -876,6 +916,10 @@ class App(BaseHTTPRequestHandler):
             if not student:
                 return self.not_found()
         active_checked = "checked" if student["active"] else ""
+        sex_options = "".join(
+            f'<option value="{escape(option)}" {"selected" if student["sex"] == option else ""}>{escape(option)}</option>'
+            for option in ("Female", "Male")
+        )
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Admin</p><h1>Edit student</h1></div><a class="button" href="/students/{student_id}">Back to student</a></header>
         <form class="panel form" method="post" enctype="multipart/form-data">
@@ -884,6 +928,9 @@ class App(BaseHTTPRequestHandler):
           <label>Name <input required name="name" value="{escape(student["name"])}"></label>
           <label>School <input required name="school" value="{escape(student["school"])}"></label>
           <label>Grade level <input required name="grade_level" value="{escape(student["grade_level"])}"></label>
+          <label>Age <input type="number" min="0" max="30" name="age" value="{escape(student["age"] if student["age"] is not None else "")}"></label>
+          <label>Birthdate <input type="date" name="birthdate" value="{escape(student["birthdate"] or "")}"></label>
+          <label>Sex <select name="sex"><option value="">Choose one</option>{sex_options}</select></label>
           <label>Replace profile photo <input type="file" name="profile_photo" accept=".jpg,.jpeg,.png,image/jpeg,image/png"></label>
           <p class="hint">JPG, JPEG, or PNG photos up to 75 MB.</p>
           <label class="check"><input type="checkbox" name="active" {active_checked}> Active</label>
@@ -899,6 +946,9 @@ class App(BaseHTTPRequestHandler):
             name = self.val(form, "name")
             school = self.val(form, "school")
             grade_level = self.val(form, "grade_level")
+            age = self.optional_int(self.val(form, "age"), "Age")
+            birthdate = self.val(form, "birthdate")
+            sex = self.val(form, "sex")
             if not name or not school or not grade_level:
                 return self.student_edit_get(student_id, "Please fill in the student name, school, and grade level.")
             photo_field = form["profile_photo"] if isinstance(form, MultipartForm) and "profile_photo" in form else None
@@ -908,8 +958,8 @@ class App(BaseHTTPRequestHandler):
                 if not student:
                     return self.not_found()
                 conn.execute(
-                    "UPDATE students SET name=?, school=?, grade_level=?, active=? WHERE id=?",
-                    (name, school, grade_level, 1 if self.val(form, "active") else 0, student_id),
+                    "UPDATE students SET name=?, school=?, grade_level=?, age=?, birthdate=?, sex=?, active=? WHERE id=?",
+                    (name, school, grade_level, age, birthdate, sex, 1 if self.val(form, "active") else 0, student_id),
                 )
                 old_photo_id = student["profile_photo_file_id"]
                 if new_photo_id:
@@ -1349,7 +1399,7 @@ class App(BaseHTTPRequestHandler):
             """
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor portal</p><h1>{escape(student["name"])}</h1></div></header>
-        <section class="detail"><div class="panel">{self.student_card(student, portal=True)}</div><div class="panel"><h2>School</h2><p>{escape(student["school"])}</p><p>{escape(student["grade_level"])}</p></div></section>
+        <section class="detail"><div class="panel">{self.student_card(student, portal=True)}</div><div class="panel"><h2>Student information</h2>{self.student_info_list(student)}</div></section>
         <section>{body_updates or '<div class="panel"><p class="muted">No approved updates yet.</p></div>'}</section>
         """
         return self.send_html(self.layout(student["name"], body))
