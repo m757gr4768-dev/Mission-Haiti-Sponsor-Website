@@ -805,7 +805,7 @@ class App(BaseHTTPRequestHandler):
             <h1>Mission-Haiti portal</h1>
             <p>Staff can create updates for review. Sponsors see only approved updates for students linked to them.</p>
             <div class="photo-strip" aria-hidden="true">
-              <img src="/static/students-classroom.png" alt="">
+              <img src="/static/students-classroom-new.jpg" alt="">
             </div>
           </div>
           <form class="panel" method="post" action="/login">
@@ -1003,7 +1003,7 @@ class App(BaseHTTPRequestHandler):
           {create_button}
         </header>
         <section class="mission-banner">
-          <img src="/static/students-classroom.png" alt="">
+          <img src="/static/students-classroom-new.jpg" alt="">
           <div>
             <p class="eyebrow">Privacy-first updates</p>
             <h2>Share progress with the right sponsor, only after approval.</h2>
@@ -1034,7 +1034,7 @@ class App(BaseHTTPRequestHandler):
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor portal</p><h1>Your students</h1></div></header>
         <section class="mission-banner sponsor">
-          <img src="/static/students-classroom.png" alt="">
+          <img src="/static/students-classroom-new.jpg" alt="">
           <div>
             <p class="eyebrow">Connected with care</p>
             <h2>Approved school updates in one secure place.</h2>
