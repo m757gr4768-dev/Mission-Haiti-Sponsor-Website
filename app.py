@@ -57,6 +57,7 @@ SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USERNAME)
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Mission-Haiti")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ("1", "true", "yes", "on")
 SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "false").lower() in ("1", "true", "yes", "on")
+PASSWORD_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
 ROLES = {"admin": "Admin", "staff": "Haiti staff", "sponsor": "Sponsor"}
 FILE_KINDS = {
@@ -173,6 +174,14 @@ def send_email(recipient, subject, body):
     return "sent", "Email sent."
 
 
+def password_token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def token_expires_at():
+    return datetime.fromtimestamp(time.time() + PASSWORD_TOKEN_TTL_SECONDS, timezone.utc).isoformat(timespec="seconds")
+
+
 def init_db():
     DATA_DIR.mkdir(exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -254,6 +263,17 @@ def init_db():
                 FOREIGN KEY(update_id) REFERENCES updates(id),
                 FOREIGN KEY(sponsor_id) REFERENCES sponsors(id)
             );
+            CREATE TABLE IF NOT EXISTS password_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                purpose TEXT NOT NULL CHECK(purpose IN ('invite','reset')),
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_password_tokens_hash ON password_tokens(token_hash);
             """
         )
         existing_email_columns = {row["name"] for row in conn.execute("PRAGMA table_info(email_notifications)").fetchall()}
@@ -309,6 +329,10 @@ class App(BaseHTTPRequestHandler):
                 return self.static_file(self.path_only.removeprefix("/static/"))
             if self.path_only == "/login":
                 return self.login_get() if method == "GET" else self.login_post()
+            if self.path_only == "/forgot-password":
+                return self.forgot_password_get() if method == "GET" else self.forgot_password_post()
+            if self.path_only == "/set-password":
+                return self.set_password_get() if method == "GET" else self.set_password_post()
             if self.path_only == "/logout" and method == "POST":
                 return self.logout_post()
             if self.path_only.startswith("/files/") and method == "GET":
@@ -339,6 +363,8 @@ class App(BaseHTTPRequestHandler):
                 return self.sponsor_edit_get(sponsor_id) if method == "GET" else self.sponsor_edit_post(sponsor_id)
             if self.path_only.startswith("/sponsors/") and self.path_only.endswith("/delete") and method == "POST":
                 return self.sponsor_delete_post(int(self.path_only.split("/")[-2]))
+            if self.path_only.startswith("/sponsors/") and self.path_only.endswith("/invite") and method == "POST":
+                return self.sponsor_invite_post(int(self.path_only.split("/")[-2]))
             if self.path_only == "/admins" and method == "GET":
                 return self.admins_index()
             if self.path_only.startswith("/admins/") and self.path_only.endswith("/delete") and method == "POST":
@@ -507,6 +533,29 @@ class App(BaseHTTPRequestHandler):
                 (update_id, kind, original, storage_name, content_type, size, uploaded_by, now()),
             ).lastrowid
 
+    def create_password_token(self, conn, user_id, purpose):
+        token = secrets.token_urlsafe(40)
+        conn.execute(
+            "INSERT INTO password_tokens (user_id,token_hash,purpose,expires_at,created_at) VALUES (?,?,?,?,?)",
+            (user_id, password_token_hash(token), purpose, token_expires_at(), now()),
+        )
+        return token
+
+    def send_password_link(self, conn, user, purpose):
+        token = self.create_password_token(conn, user["id"], purpose)
+        link = f"{APP_BASE_URL}/set-password?token={urllib.parse.quote(token)}"
+        verb = "set up" if purpose == "invite" else "reset"
+        subject = f"Mission-Haiti sponsor portal password {verb}"
+        body = (
+            f"Hello {user['name']},\n\n"
+            f"Use this secure link to {verb} your Mission-Haiti sponsor portal password:\n"
+            f"{link}\n\n"
+            "This link expires in 7 days and can only be used once.\n\n"
+            "If you did not request this, you can ignore this email.\n\n"
+            "Mission-Haiti"
+        )
+        return send_email(user["email"], subject, body)
+
     def login_get(self, message=""):
         body = f"""
         <section class="auth">
@@ -525,6 +574,7 @@ class App(BaseHTTPRequestHandler):
             <label>Email <input required type="email" name="email" autocomplete="email"></label>
             <label>Password <input required type="password" name="password" autocomplete="current-password"></label>
             <button class="primary">Sign in</button>
+            <p class="muted"><a href="/forgot-password">Set or reset sponsor password</a></p>
             <p class="muted">Demo: admin@mission-haiti.local / admin123</p>
           </form>
         </section>
@@ -545,6 +595,117 @@ class App(BaseHTTPRequestHandler):
         for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
+
+    def forgot_password_get(self, message=""):
+        body = f"""
+        <section class="auth">
+          <div class="authcopy">
+            <img class="authlogo" src="/static/mission-haiti-logo.svg" alt="Mission-Haiti logo">
+            <p class="eyebrow">Sponsor access</p>
+            <h1>Reset password</h1>
+            <p>Enter the email on your sponsor record and we will send a secure link to set a new password.</p>
+          </div>
+          <form class="panel" method="post" action="/forgot-password">
+            <h2>Email a secure link</h2>
+            {f'<p class="notice">{escape(message)}</p>' if message else ''}
+            <label>Email <input required type="email" name="email" autocomplete="email"></label>
+            <button class="primary">Send password link</button>
+            <p class="muted"><a href="/login">Back to sign in</a></p>
+          </form>
+        </section>
+        """
+        return self.send_html(self.layout("Reset password", body))
+
+    def forgot_password_post(self):
+        form = self.form_fields()
+        email = self.val(form, "email").lower()
+        with db() as conn:
+            user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+            if user:
+                self.send_password_link(conn, user, "reset")
+        return self.forgot_password_get("If that email is in the system, a password link has been sent.")
+
+    def set_password_get(self, message=""):
+        token = self.query.get("token", [""])[0]
+        user = self.user_for_password_token(token)
+        if not user:
+            body = """
+            <section class="auth">
+              <div class="authcopy">
+                <img class="authlogo" src="/static/mission-haiti-logo.svg" alt="Mission-Haiti logo">
+                <p class="eyebrow">Secure sponsor updates</p>
+                <h1>Link expired</h1>
+                <p>This password link is expired or has already been used.</p>
+              </div>
+              <div class="panel">
+                <h2>Need a new link?</h2>
+                <p class="muted">Request another secure password link from the reset page.</p>
+                <a class="button primary" href="/forgot-password">Send a new link</a>
+              </div>
+            </section>
+            """
+            return self.send_html(self.layout("Set password", body), HTTPStatus.BAD_REQUEST)
+        body = f"""
+        <section class="auth">
+          <div class="authcopy">
+            <img class="authlogo" src="/static/mission-haiti-logo.svg" alt="Mission-Haiti logo">
+            <p class="eyebrow">Welcome</p>
+            <h1>Set your password</h1>
+            <p>Create a password for {escape(user["email"])}. After saving, you will be signed in to the secure portal.</p>
+          </div>
+          <form class="panel" method="post" action="/set-password">
+            <h2>Choose a password</h2>
+            {f'<p class="alert">{escape(message)}</p>' if message else ''}
+            <input type="hidden" name="token" value="{escape(token)}">
+            <label>New password <input required type="password" name="password" autocomplete="new-password" minlength="8"></label>
+            <label>Confirm password <input required type="password" name="password_confirm" autocomplete="new-password" minlength="8"></label>
+            <button class="primary">Save password</button>
+          </form>
+        </section>
+        """
+        return self.send_html(self.layout("Set password", body))
+
+    def set_password_post(self):
+        form = self.form_fields()
+        token = self.val(form, "token")
+        password = self.val(form, "password")
+        password_confirm = self.val(form, "password_confirm")
+        if len(password) < 8:
+            self.query = {"token": [token]}
+            return self.set_password_get("Please choose a password with at least 8 characters.")
+        if password != password_confirm:
+            self.query = {"token": [token]}
+            return self.set_password_get("The password confirmation did not match.")
+        token_hash = password_token_hash(token)
+        with db() as conn:
+            row = conn.execute(
+                """SELECT pt.*, u.* FROM password_tokens pt
+                   JOIN users u ON u.id=pt.user_id
+                   WHERE pt.token_hash=? AND pt.used_at IS NULL AND pt.expires_at > ?""",
+                (token_hash, now()),
+            ).fetchone()
+            if not row:
+                self.query = {"token": [token]}
+                return self.set_password_get("This password link is expired or has already been used.")
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(password), row["user_id"]))
+            conn.execute("UPDATE password_tokens SET used_at=? WHERE id=?", (now(), row["id"]))
+            conn.execute("UPDATE password_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL AND id<>?", (now(), row["user_id"], row["id"]))
+            user_id = row["user_id"]
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", "/dashboard")
+        self.send_header("Set-Cookie", session_cookie(sign_session(user_id)))
+        self.end_headers()
+
+    def user_for_password_token(self, token):
+        if not token:
+            return None
+        with db() as conn:
+            return conn.execute(
+                """SELECT u.* FROM password_tokens pt
+                   JOIN users u ON u.id=pt.user_id
+                   WHERE pt.token_hash=? AND pt.used_at IS NULL AND pt.expires_at > ?""",
+                (password_token_hash(token), now()),
+            ).fetchone()
 
     def logout_post(self):
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -799,6 +960,7 @@ class App(BaseHTTPRequestHandler):
 
     def sponsors_index(self):
         self.require_roles("admin")
+        message = self.query.get("message", [""])[0]
         with db() as conn:
             sponsors = conn.execute("SELECT * FROM sponsors ORDER BY name").fetchall()
             links = conn.execute("SELECT ss.sponsor_id, st.name FROM sponsor_students ss JOIN students st ON st.id=ss.student_id ORDER BY st.name").fetchall()
@@ -806,11 +968,12 @@ class App(BaseHTTPRequestHandler):
         for link in links:
             names.setdefault(link["sponsor_id"], []).append(link["name"])
         rows = "".join(
-            f'<tr><td>{escape(s["name"])}</td><td>{escape(s["email"])}</td><td>{escape(", ".join(names.get(s["id"], [])))}</td><td><div class="actions"><a class="button" href="/sponsors/{s["id"]}/edit">Edit</a><form method="post" action="/sponsors/{s["id"]}/delete"><button class="danger">Remove</button></form></div></td></tr>'
+            f'<tr><td>{escape(s["name"])}</td><td>{escape(s["email"])}</td><td>{escape(", ".join(names.get(s["id"], [])))}</td><td><div class="actions"><a class="button" href="/sponsors/{s["id"]}/edit">Edit</a><form method="post" action="/sponsors/{s["id"]}/invite"><button>Send password link</button></form><form method="post" action="/sponsors/{s["id"]}/delete"><button class="danger">Remove</button></form></div></td></tr>'
             for s in sponsors
         )
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Records</p><h1>Sponsors</h1></div><a class="button primary" href="/sponsors/new">Add sponsor</a></header>
+        {f'<p class="notice">{escape(message)}</p>' if message else ''}
         <div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Linked students</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="4">No sponsors yet.</td></tr>'}</tbody></table></div>
         """
         return self.send_html(self.layout("Sponsors", body))
@@ -825,7 +988,7 @@ class App(BaseHTTPRequestHandler):
         <form class="panel form" method="post">
           <label>Name <input required name="name"></label>
           <label>Email <input required type="email" name="email"></label>
-          <label>Temporary password <input required name="password" value="sponsor123"></label>
+          <label class="check"><input type="checkbox" name="send_invite" checked> Email this sponsor a secure password setup link</label>
           <fieldset><legend>Linked students</legend>{options or '<p class="muted">Add students first.</p>'}</fieldset>
           <button class="primary">Save sponsor</button>
         </form>
@@ -835,14 +998,31 @@ class App(BaseHTTPRequestHandler):
     def sponsor_new_post(self):
         self.require_roles("admin")
         form = self.form_fields()
-        name, email, password = self.val(form, "name"), self.val(form, "email").lower(), self.val(form, "password")
-        with db() as conn:
-            user_id = conn.execute("INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)", (name, email, hash_password(password), "sponsor", now())).lastrowid
-            sponsor_id = conn.execute("INSERT INTO sponsors (name,email,user_id,created_at) VALUES (?,?,?,?)", (name, email, user_id, now())).lastrowid
-            conn.execute("UPDATE users SET sponsor_id=? WHERE id=?", (sponsor_id, user_id))
-            for student_id in self.vals(form, "student_ids"):
-                conn.execute("INSERT OR IGNORE INTO sponsor_students (sponsor_id,student_id) VALUES (?,?)", (sponsor_id, int(student_id)))
-        return self.redirect("/sponsors")
+        name, email = self.val(form, "name"), self.val(form, "email").lower()
+        send_invite = bool(self.val(form, "send_invite"))
+        if not name or not email:
+            return self.sponsor_new_get()
+        try:
+            with db() as conn:
+                user_id = conn.execute(
+                    "INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)",
+                    (name, email, hash_password(secrets.token_urlsafe(32)), "sponsor", now()),
+                ).lastrowid
+                sponsor_id = conn.execute("INSERT INTO sponsors (name,email,user_id,created_at) VALUES (?,?,?,?)", (name, email, user_id, now())).lastrowid
+                conn.execute("UPDATE users SET sponsor_id=? WHERE id=?", (sponsor_id, user_id))
+                for student_id in self.vals(form, "student_ids"):
+                    conn.execute("INSERT OR IGNORE INTO sponsor_students (sponsor_id,student_id) VALUES (?,?)", (sponsor_id, int(student_id)))
+            message = "Sponsor saved."
+            if send_invite:
+                with db() as conn:
+                    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+                    status, provider_message = self.send_password_link(conn, user, "invite")
+                message = f"Sponsor saved. Password setup email {status}: {provider_message}"
+            return self.redirect(f"/sponsors?message={urllib.parse.quote(message)}")
+        except sqlite3.IntegrityError:
+            return self.error_page(HTTPStatus.BAD_REQUEST, "That email is already being used by another account.")
+        except sqlite3.Error as exc:
+            return self.error_page(HTTPStatus.BAD_REQUEST, f"The sponsor could not be saved: {exc}")
 
     def sponsor_edit_get(self, sponsor_id, message=""):
         self.require_roles("admin")
@@ -863,6 +1043,7 @@ class App(BaseHTTPRequestHandler):
           <label>Name <input required name="name" value="{escape(sponsor["name"])}"></label>
           <label>Email <input required type="email" name="email" value="{escape(sponsor["email"])}"></label>
           <label>New password <input name="password" placeholder="Leave blank to keep current password"></label>
+          <p class="hint">Use "Send password link" on the sponsor list when you want the sponsor to set their own password by email.</p>
           <fieldset><legend>Linked students</legend>{options or '<p class="muted">Add students first.</p>'}</fieldset>
           <button class="primary">Save changes</button>
         </form>
@@ -891,7 +1072,7 @@ class App(BaseHTTPRequestHandler):
                 else:
                     user_id = conn.execute(
                         "INSERT INTO users (name,email,password_hash,role,sponsor_id,created_at) VALUES (?,?,?,?,?,?)",
-                        (name, email, hash_password(password or "sponsor123"), "sponsor", sponsor_id, now()),
+                        (name, email, hash_password(password or secrets.token_urlsafe(32)), "sponsor", sponsor_id, now()),
                     ).lastrowid
                     conn.execute("UPDATE sponsors SET user_id=? WHERE id=?", (user_id, sponsor_id))
                 conn.execute("DELETE FROM sponsor_students WHERE sponsor_id=?", (sponsor_id,))
@@ -910,6 +1091,8 @@ class App(BaseHTTPRequestHandler):
                 sponsor = conn.execute("SELECT * FROM sponsors WHERE id=?", (sponsor_id,)).fetchone()
                 if not sponsor:
                     return self.not_found()
+                if sponsor["user_id"]:
+                    conn.execute("DELETE FROM password_tokens WHERE user_id=?", (sponsor["user_id"],))
                 conn.execute("DELETE FROM email_notifications WHERE sponsor_id=?", (sponsor_id,))
                 conn.execute("DELETE FROM sponsor_students WHERE sponsor_id=?", (sponsor_id,))
                 conn.execute("DELETE FROM sponsors WHERE id=?", (sponsor_id,))
@@ -918,6 +1101,28 @@ class App(BaseHTTPRequestHandler):
             return self.redirect("/sponsors")
         except sqlite3.Error as exc:
             return self.error_page(HTTPStatus.BAD_REQUEST, f"The sponsor could not be removed: {exc}")
+
+    def sponsor_invite_post(self, sponsor_id):
+        self.require_roles("admin")
+        try:
+            with db() as conn:
+                sponsor = conn.execute("SELECT * FROM sponsors WHERE id=?", (sponsor_id,)).fetchone()
+                if not sponsor:
+                    return self.not_found()
+                if sponsor["user_id"]:
+                    user = conn.execute("SELECT * FROM users WHERE id=?", (sponsor["user_id"],)).fetchone()
+                else:
+                    user_id = conn.execute(
+                        "INSERT INTO users (name,email,password_hash,role,sponsor_id,created_at) VALUES (?,?,?,?,?,?)",
+                        (sponsor["name"], sponsor["email"], hash_password(secrets.token_urlsafe(32)), "sponsor", sponsor_id, now()),
+                    ).lastrowid
+                    conn.execute("UPDATE sponsors SET user_id=? WHERE id=?", (user_id, sponsor_id))
+                    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+                status, provider_message = self.send_password_link(conn, user, "reset")
+            message = f"Password email {status}: {provider_message}"
+            return self.redirect(f"/sponsors?message={urllib.parse.quote(message)}")
+        except sqlite3.Error as exc:
+            return self.error_page(HTTPStatus.BAD_REQUEST, f"The password link could not be sent: {exc}")
 
     def admins_index(self):
         self.require_roles("admin")
