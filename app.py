@@ -1038,6 +1038,7 @@ class App(BaseHTTPRequestHandler):
           <div>
             <p class="eyebrow">Connected with care</p>
             <h2>Approved school updates in one secure place.</h2>
+            <p>The MH Sponsorship Program is more than receiving updates. It is a personal connection built through prayer, encouragement, and shared moments. As you view your student’s updates, we invite you to pray for them by name and celebrate what God is doing in their life. You can also send short videos, pictures, or written messages of encouragement back to your student, which our Mission-Haiti team will share with them in Haiti. These simple messages help students feel known, loved, and supported, making sponsorship a meaningful relationship instead of just a financial transaction.</p>
             <p>Each update is reviewed before it appears here, and only linked sponsors can view it.</p>
           </div>
         </section>
@@ -1870,6 +1871,14 @@ class App(BaseHTTPRequestHandler):
             """
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor portal</p><h1>{escape(student["name"])}</h1></div></header>
+        <section class="mission-banner sponsor">
+          <img src="/static/sponsor-student-updates.jpg" alt="">
+          <div>
+            <p class="eyebrow">A personal connection</p>
+            <h2>Student updates are a bridge for prayer and encouragement.</h2>
+            <p>View each approved update, pray for your student by name, and send short notes, pictures, or videos that our Mission-Haiti team can share with them in Haiti.</p>
+          </div>
+        </section>
         <section class="detail"><div class="panel">{self.student_card(student, portal=True)}</div><div class="panel"><h2>Student information</h2>{self.student_info_list(student)}</div></section>
         <section>{body_updates or '<div class="panel"><p class="muted">No approved updates yet.</p></div>'}</section>
         """
