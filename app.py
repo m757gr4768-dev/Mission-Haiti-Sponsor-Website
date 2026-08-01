@@ -80,6 +80,8 @@ FILE_KINDS = {
     "report_card": "Grades/report card",
     "photo": "Photo",
     "video": "Video",
+    "sponsor_photo": "Sponsor photo",
+    "sponsor_video": "Sponsor video",
 }
 
 
@@ -307,6 +309,18 @@ def init_db():
                 FOREIGN KEY(created_by) REFERENCES users(id),
                 FOREIGN KEY(approved_by) REFERENCES users(id)
             );
+            CREATE TABLE IF NOT EXISTS sponsor_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sponsor_id INTEGER NOT NULL,
+                student_id INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('submitted','shared','archived')) DEFAULT 'submitted',
+                created_at TEXT NOT NULL,
+                shared_at TEXT,
+                archived_at TEXT,
+                FOREIGN KEY(sponsor_id) REFERENCES sponsors(id) ON DELETE CASCADE,
+                FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS email_notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 update_id INTEGER NOT NULL,
@@ -397,6 +411,9 @@ def init_db():
             conn.execute("ALTER TABLE sponsors ADD COLUMN phone TEXT")
         if "notification_preference" not in existing_sponsor_columns:
             conn.execute("ALTER TABLE sponsors ADD COLUMN notification_preference TEXT NOT NULL DEFAULT 'email'")
+        existing_file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(update_files)").fetchall()}
+        if "sponsor_message_id" not in existing_file_columns:
+            conn.execute("ALTER TABLE update_files ADD COLUMN sponsor_message_id INTEGER")
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count:
             return
@@ -527,10 +544,23 @@ class App(BaseHTTPRequestHandler):
                     return self.update_approve(update_id)
                 if len(parts) == 4 and parts[3] == "resend" and method == "POST":
                     return self.update_resend(update_id)
+            if self.path_only == "/sponsor-messages" and method == "GET":
+                return self.sponsor_messages_index()
+            if self.path_only.startswith("/sponsor-messages/"):
+                parts = self.path_only.split("/")
+                message_id = int(parts[2])
+                if len(parts) == 3 and method == "GET":
+                    return self.sponsor_message_detail(message_id)
+                if len(parts) == 4 and parts[3] == "share" and method == "POST":
+                    return self.sponsor_message_share(message_id)
+                if len(parts) == 4 and parts[3] == "delete" and method == "POST":
+                    return self.sponsor_message_delete(message_id)
             if self.path_only.startswith("/emails/") and self.path_only.endswith("/retry") and method == "POST":
                 return self.email_retry(int(self.path_only.split("/")[-2]))
             if self.path_only.startswith("/sms/") and self.path_only.endswith("/retry") and method == "POST":
                 return self.sms_retry(int(self.path_only.split("/")[-2]))
+            if self.path_only.startswith("/portal/students/") and self.path_only.endswith("/messages") and method == "POST":
+                return self.portal_message_post(int(self.path_only.split("/")[-2]))
             if self.path_only.startswith("/portal/students/") and method == "GET":
                 return self.portal_student(int(self.path_only.split("/")[-1]))
             return self.not_found()
@@ -660,6 +690,8 @@ class App(BaseHTTPRequestHandler):
             links.append('<a href="/admins">Admins</a>')
         if self.has_permission("create_updates"):
             links.append('<a href="/updates/new">New update</a>')
+        if self.has_permission("create_updates") or self.has_permission("approve_updates"):
+            links.append('<a href="/sponsor-messages">Sponsor messages</a>')
         if self.can_bulk_import():
             links.append('<a href="/bulk">Bulk import</a>')
         return "".join(links)
@@ -1713,6 +1745,12 @@ class App(BaseHTTPRequestHandler):
                         storage_names.append(file["storage_name"])
                     conn.execute(f"DELETE FROM email_notifications WHERE update_id IN ({qmarks(update_ids)})", update_ids)
                     conn.execute(f"DELETE FROM sms_notifications WHERE update_id IN ({qmarks(update_ids)})", update_ids)
+                message_ids = [row["id"] for row in conn.execute("SELECT id FROM sponsor_messages WHERE student_id=?", (student_id,)).fetchall()]
+                if message_ids:
+                    for file in conn.execute(f"SELECT storage_name FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids).fetchall():
+                        storage_names.append(file["storage_name"])
+                    conn.execute(f"DELETE FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids)
+                    conn.execute("DELETE FROM sponsor_messages WHERE student_id=?", (student_id,))
                 conn.execute("DELETE FROM sponsor_students WHERE student_id=?", (student_id,))
                 conn.execute("DELETE FROM students WHERE id=?", (student_id,))
                 if student["profile_photo_file_id"]:
@@ -1945,11 +1983,18 @@ class App(BaseHTTPRequestHandler):
 
     def sponsor_delete_post(self, sponsor_id):
         self.require_permission("manage_sponsors")
+        storage_names = []
         try:
             with db() as conn:
                 sponsor = conn.execute("SELECT * FROM sponsors WHERE id=?", (sponsor_id,)).fetchone()
                 if not sponsor:
                     return self.not_found()
+                message_ids = [row["id"] for row in conn.execute("SELECT id FROM sponsor_messages WHERE sponsor_id=?", (sponsor_id,)).fetchall()]
+                if message_ids:
+                    for file in conn.execute(f"SELECT storage_name FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids).fetchall():
+                        storage_names.append(file["storage_name"])
+                    conn.execute(f"DELETE FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids)
+                    conn.execute("DELETE FROM sponsor_messages WHERE sponsor_id=?", (sponsor_id,))
                 if sponsor["user_id"]:
                     conn.execute("DELETE FROM password_tokens WHERE user_id=?", (sponsor["user_id"],))
                 conn.execute("DELETE FROM email_notifications WHERE sponsor_id=?", (sponsor_id,))
@@ -1959,6 +2004,7 @@ class App(BaseHTTPRequestHandler):
                 conn.execute("DELETE FROM sponsors WHERE id=?", (sponsor_id,))
                 if sponsor["user_id"]:
                     conn.execute("DELETE FROM users WHERE id=? AND role='sponsor'", (sponsor["user_id"],))
+            self.delete_storage_files(storage_names)
             return self.redirect("/sponsors")
         except sqlite3.Error as exc:
             return self.error_page(HTTPStatus.BAD_REQUEST, f"The sponsor could not be removed: {exc}")
@@ -2385,12 +2431,141 @@ class App(BaseHTTPRequestHandler):
                         (update["id"], sponsor["id"], recipient_phone, sms_body, now(), status, provider_message, now()),
                     )
 
-    def portal_student(self, student_id):
+    def sponsor_messages_index(self):
+        if not (self.has_permission("create_updates") or self.has_permission("approve_updates")):
+            raise PermissionError()
+        status = self.query.get("status", ["submitted"])[0]
+        if status not in ("submitted", "shared", "all"):
+            status = "submitted"
+        params = []
+        where = ""
+        if status != "all":
+            where = "WHERE sm.status=?"
+            params.append(status)
+        with db() as conn:
+            messages = conn.execute(
+                f"""SELECT sm.*, sp.name sponsor_name, st.name student_name, st.student_number
+                    FROM sponsor_messages sm
+                    JOIN sponsors sp ON sp.id=sm.sponsor_id
+                    JOIN students st ON st.id=sm.student_id
+                    {where}
+                    ORDER BY sm.created_at DESC""",
+                params,
+            ).fetchall()
+        tabs = "".join(
+            f'<a class="button {"primary" if status == value else ""}" href="/sponsor-messages?status={value}">{escape(label)}</a>'
+            for value, label in (("submitted", "New"), ("shared", "Shared"), ("all", "All"))
+        )
+        rows = "".join(
+            f"""
+            <tr>
+              <td><a href="/sponsor-messages/{message["id"]}">{escape(message["sponsor_name"])}</a></td>
+              <td>{escape(message["student_name"])}</td>
+              <td>{escape(message["status"])}</td>
+              <td>{escape(message["created_at"][:19])}</td>
+            </tr>
+            """
+            for message in messages
+        )
+        body = f"""
+        <header class="pagehead"><div><p class="eyebrow">Sponsor replies</p><h1>Sponsor messages</h1></div></header>
+        <div class="actions">{tabs}</div>
+        <section class="panel">
+          <h2>Messages from sponsors</h2>
+          <div class="tablewrap"><table><thead><tr><th>Sponsor</th><th>Student</th><th>Status</th><th>Sent</th></tr></thead><tbody>{rows or '<tr><td colspan="4">No sponsor messages found.</td></tr>'}</tbody></table></div>
+        </section>
+        """
+        return self.send_html(self.layout("Sponsor messages", body))
+
+    def sponsor_message_detail(self, message_id):
+        if not (self.has_permission("create_updates") or self.has_permission("approve_updates")):
+            raise PermissionError()
+        with db() as conn:
+            message = conn.execute(
+                """SELECT sm.*, sp.name sponsor_name, sp.email sponsor_email, st.name student_name, st.student_number
+                   FROM sponsor_messages sm
+                   JOIN sponsors sp ON sp.id=sm.sponsor_id
+                   JOIN students st ON st.id=sm.student_id
+                   WHERE sm.id=?""",
+                (message_id,),
+            ).fetchone()
+            if not message:
+                return self.not_found()
+            files = conn.execute("SELECT * FROM update_files WHERE sponsor_message_id=? ORDER BY kind, original_name", (message_id,)).fetchall()
+        actions = ""
+        if message["status"] == "submitted":
+            actions += f'<form method="post" action="/sponsor-messages/{message_id}/share"><button class="primary">Mark shared with student</button></form>'
+        actions += f'<form method="post" action="/sponsor-messages/{message_id}/delete" onsubmit="return confirm(\'Remove this sponsor message?\')"><button class="danger">Remove message</button></form>'
+        body = f"""
+        <header class="pagehead"><div><p class="eyebrow">Sponsor message</p><h1>{escape(message["student_name"])}</h1></div><span class="pill">{escape(message["status"])}</span></header>
+        <section class="panel">
+          <p><strong>From:</strong> {escape(message["sponsor_name"])} &lt;{escape(message["sponsor_email"])}&gt;</p>
+          <p><strong>Student:</strong> {escape(message["student_name"])} {f'({escape(message["student_number"])})' if message["student_number"] else ''}</p>
+          <p class="note">{escape(message["note"])}</p>
+          <div class="actions">{actions}</div>
+        </section>
+        <section class="panel"><h2>Photos and videos</h2>{self.file_list(files)}</section>
+        """
+        return self.send_html(self.layout("Sponsor message", body))
+
+    def sponsor_message_share(self, message_id):
+        self.require_permission("approve_updates")
+        with db() as conn:
+            message = conn.execute("SELECT * FROM sponsor_messages WHERE id=?", (message_id,)).fetchone()
+            if not message:
+                return self.not_found()
+            conn.execute("UPDATE sponsor_messages SET status='shared', shared_at=? WHERE id=?", (now(), message_id))
+        return self.redirect(f"/sponsor-messages/{message_id}")
+
+    def sponsor_message_delete(self, message_id):
+        if not (self.has_permission("create_updates") or self.has_permission("approve_updates")):
+            raise PermissionError()
+        with db() as conn:
+            files = conn.execute("SELECT storage_name FROM update_files WHERE sponsor_message_id=?", (message_id,)).fetchall()
+            conn.execute("DELETE FROM update_files WHERE sponsor_message_id=?", (message_id,))
+            conn.execute("DELETE FROM sponsor_messages WHERE id=?", (message_id,))
+        self.delete_storage_files([file["storage_name"] for file in files])
+        return self.redirect("/sponsor-messages")
+
+    def portal_message_post(self, student_id):
+        if self.user["role"] != "sponsor" or not self.sponsor_can_view_student(student_id, approved_only=False):
+            raise PermissionError()
+        try:
+            form = self.form_fields()
+            note = self.val(form, "note")
+            if not note:
+                return self.portal_student(student_id, "Please write a short message before sending.")
+            with db() as conn:
+                message_id = conn.execute(
+                    "INSERT INTO sponsor_messages (sponsor_id,student_id,note,status,created_at) VALUES (?,?,?,?,?)",
+                    (self.user["sponsor_id"], student_id, note, "submitted", now()),
+                ).lastrowid
+            if isinstance(form, MultipartForm):
+                for name, kind in (("photos", "sponsor_photo"), ("videos", "sponsor_video")):
+                    if name in form:
+                        fields = form[name] if isinstance(form[name], list) else [form[name]]
+                        for field in fields:
+                            fid = self.save_file(field, kind, self.user["id"])
+                            if fid:
+                                with db() as conn:
+                                    conn.execute("UPDATE update_files SET sponsor_message_id=? WHERE id=?", (message_id, fid))
+            return self.redirect(f"/portal/students/{student_id}?message={urllib.parse.quote('Your message was sent to the Mission-Haiti team.')}")
+        except ValueError as exc:
+            return self.portal_student(student_id, str(exc))
+        except (OSError, sqlite3.Error) as exc:
+            return self.portal_student(student_id, f"Your message could not be sent: {exc}")
+
+    def portal_student(self, student_id, message=""):
         if not self.sponsor_can_view_student(student_id, approved_only=False):
             raise PermissionError()
+        message = message or self.query.get("message", [""])[0]
         with db() as conn:
             student = conn.execute("SELECT * FROM students WHERE id=? AND active=1", (student_id,)).fetchone()
             updates = conn.execute("SELECT * FROM updates WHERE student_id=? AND status='approved' ORDER BY approved_at DESC", (student_id,)).fetchall()
+            sponsor_messages = conn.execute(
+                "SELECT * FROM sponsor_messages WHERE sponsor_id=? AND student_id=? ORDER BY created_at DESC LIMIT 5",
+                (self.user["sponsor_id"], student_id),
+            ).fetchall() if self.user["role"] == "sponsor" else []
             file_map = {}
             if updates:
                 ids = [u["id"] for u in updates]
@@ -2405,6 +2580,10 @@ class App(BaseHTTPRequestHandler):
               {self.file_list(file_map.get(update["id"], []))}
             </article>
             """
+        previous_messages = "".join(
+            f'<li>{escape(message_row["created_at"][:10])}: <span class="pill">{escape(message_row["status"])}</span> {escape(message_row["note"][:90])}</li>'
+            for message_row in sponsor_messages
+        )
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor portal</p><h1>{escape(student["name"])}</h1></div></header>
         <section class="mission-banner sponsor">
@@ -2416,6 +2595,18 @@ class App(BaseHTTPRequestHandler):
           </div>
         </section>
         <section class="detail"><div class="panel">{self.student_card(student, portal=True)}</div><div class="panel"><h2>Student information</h2>{self.student_info_list(student)}</div></section>
+        <section class="panel">
+          <h2>Send encouragement to {escape(student["name"])}</h2>
+          {f'<p class="notice">{escape(message)}</p>' if message and "sent" in message.lower() else f'<p class="alert">{escape(message)}</p>' if message else ''}
+          <form class="form" method="post" action="/portal/students/{student_id}/messages" enctype="multipart/form-data">
+            <label>Message <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your student."></textarea></label>
+            <label>Pictures <input type="file" name="photos" accept="image/*" multiple></label>
+            <label>Videos <input type="file" name="videos" accept="video/*" multiple></label>
+            <p class="hint">The Mission-Haiti team reviews sponsor messages before sharing them with students in Haiti.</p>
+            <button class="primary">Send message</button>
+          </form>
+          {f'<h3>Recently sent</h3><ul class="list">{previous_messages}</ul>' if previous_messages else ''}
+        </section>
         <section>{body_updates or '<div class="panel"><p class="muted">No approved updates yet.</p></div>'}</section>
         """
         return self.send_html(self.layout(student["name"], body))
@@ -2478,6 +2669,11 @@ class App(BaseHTTPRequestHandler):
                            JOIN sponsor_students ss ON ss.student_id=u.student_id
                            WHERE u.id=? AND u.status='approved' AND ss.sponsor_id=?""",
                         (file["update_id"], self.user["sponsor_id"]),
+                    ).fetchone())
+                elif "sponsor_message_id" in file.keys() and file["sponsor_message_id"]:
+                    allowed = bool(conn.execute(
+                        "SELECT 1 FROM sponsor_messages WHERE id=? AND sponsor_id=?",
+                        (file["sponsor_message_id"], self.user["sponsor_id"]),
                     ).fetchone())
             if not allowed:
                 raise PermissionError()
