@@ -252,6 +252,7 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS students (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_number TEXT,
                 name TEXT NOT NULL,
                 school TEXT NOT NULL,
                 grade_level TEXT NOT NULL,
@@ -379,6 +380,8 @@ def init_db():
         if "attempted_at" not in existing_email_columns:
             conn.execute("ALTER TABLE email_notifications ADD COLUMN attempted_at TEXT")
         existing_student_columns = {row["name"] for row in conn.execute("PRAGMA table_info(students)").fetchall()}
+        if "student_number" not in existing_student_columns:
+            conn.execute("ALTER TABLE students ADD COLUMN student_number TEXT")
         if "age" not in existing_student_columns:
             conn.execute("ALTER TABLE students ADD COLUMN age INTEGER")
         if "birthdate" not in existing_student_columns:
@@ -766,6 +769,22 @@ class App(BaseHTTPRequestHandler):
             unique.append(value)
         return unique
 
+    def search_query(self):
+        return self.query.get("q", [""])[0].strip()
+
+    def search_like(self, query):
+        return f"%{query.lower()}%"
+
+    def search_form(self, action, query, placeholder):
+        return f"""
+        <form class="searchbar" method="get" action="{action}">
+          <label class="sr-only" for="search-q">Search</label>
+          <input id="search-q" type="search" name="q" value="{escape(query)}" placeholder="{escape(placeholder)}">
+          <button>Search</button>
+          {f'<a class="button" href="{action}">Clear</a>' if query else ''}
+        </form>
+        """
+
     def optional_int(self, value, label):
         if not value:
             return None
@@ -1051,12 +1070,18 @@ class App(BaseHTTPRequestHandler):
         return self.send_html(self.layout("Dashboard", body))
 
     def sponsor_dashboard(self):
+        q = self.search_query()
         with db() as conn:
+            params = [self.user["sponsor_id"]]
+            where = "ss.sponsor_id=? AND st.active=1"
+            if q:
+                where += " AND (LOWER(st.name) LIKE ? OR LOWER(st.school) LIKE ? OR LOWER(st.grade_level) LIKE ? OR LOWER(COALESCE(st.student_number,'')) LIKE ?)"
+                params.extend([self.search_like(q)] * 4)
             students = conn.execute(
-                """SELECT st.* FROM students st
+                f"""SELECT st.* FROM students st
                    JOIN sponsor_students ss ON ss.student_id=st.id
-                   WHERE ss.sponsor_id=? AND st.active=1 ORDER BY st.name""",
-                (self.user["sponsor_id"],),
+                   WHERE {where} ORDER BY st.name""",
+                params,
             ).fetchall()
         cards = "".join(self.student_card(s, portal=True) for s in students)
         body = f"""
@@ -1070,7 +1095,8 @@ class App(BaseHTTPRequestHandler):
             <p>Each update is reviewed before it appears here, and only linked sponsors can view it.</p>
           </div>
         </section>
-        <section class="grid">{cards or '<p class="muted">No students are linked to your account yet.</p>'}</section>
+        {self.search_form("/dashboard", q, "Search your students by name, school, grade, or ID number")}
+        <section class="grid">{cards or f'<p class="muted">{"No matching students found." if q else "No students are linked to your account yet."}</p>'}</section>
         """
         return self.send_html(self.layout("Sponsor portal", body))
 
@@ -1078,19 +1104,22 @@ class App(BaseHTTPRequestHandler):
         url = f"/portal/students/{student['id']}" if portal else f"/students/{student['id']}"
         photo = f'<img alt="" src="/files/{student["profile_photo_file_id"]}">' if student["profile_photo_file_id"] else '<div class="avatar">MH</div>'
         status = "Active" if student["active"] else "Inactive"
+        student_number = f'ID {escape(student["student_number"])} · ' if "student_number" in student.keys() and student["student_number"] else ""
         age = f' · Age {escape(student["age"])}' if "age" in student.keys() and student["age"] is not None else ""
         return f"""
         <a class="card" href="{url}">
           {photo}
-          <div><h3>{escape(student["name"])}</h3><p>{escape(student["school"])} · {escape(student["grade_level"])}{age}</p><span class="pill">{status}</span></div>
+          <div><h3>{escape(student["name"])}</h3><p>{student_number}{escape(student["school"])} · {escape(student["grade_level"])}{age}</p><span class="pill">{status}</span></div>
         </a>
         """
 
     def student_info_list(self, student):
+        student_number = student["student_number"] or "Not listed"
         birthdate = student["birthdate"] or "Not listed"
         age = student["age"] if student["age"] is not None else "Not listed"
         sex = student["sex"] or "Not listed"
         return f"""
+        <p><b>ID Number:</b> {escape(student_number)}</p>
         <p><b>School:</b> {escape(student["school"])}</p>
         <p><b>Grade:</b> {escape(student["grade_level"])}</p>
         <p><b>Age:</b> {escape(age)}</p>
@@ -1100,11 +1129,18 @@ class App(BaseHTTPRequestHandler):
 
     def students_index(self):
         self.require_permission("manage_students")
+        q = self.search_query()
         with db() as conn:
-            students = conn.execute("SELECT * FROM students ORDER BY active DESC, name").fetchall()
+            params = []
+            where = ""
+            if q:
+                where = "WHERE LOWER(name) LIKE ? OR LOWER(school) LIKE ? OR LOWER(grade_level) LIKE ? OR LOWER(COALESCE(student_number,'')) LIKE ?"
+                params = [self.search_like(q)] * 4
+            students = conn.execute(f"SELECT * FROM students {where} ORDER BY active DESC, name", params).fetchall()
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Records</p><h1>Students</h1></div><a class="button primary" href="/students/new">Add student</a></header>
-        <section class="grid">{''.join(self.student_card(s) for s in students) or '<p class="muted">No students yet.</p>'}</section>
+        {self.search_form("/students", q, "Search students by name, school, grade, or ID number")}
+        <section class="grid">{''.join(self.student_card(s) for s in students) or f'<p class="muted">{"No matching students found." if q else "No students yet."}</p>'}</section>
         """
         return self.send_html(self.layout("Students", body))
 
@@ -1115,6 +1151,7 @@ class App(BaseHTTPRequestHandler):
         <form class="panel form" method="post" enctype="multipart/form-data">
           {f'<p class="alert">{escape(message)}</p>' if message else ''}
           <p class="hint">Name, school, and grade level are required. The profile photo is optional.</p>
+          <label>ID Number <input name="student_number" placeholder="Example: MH-00123"></label>
           <label>Name <input required name="name" placeholder="Student name"></label>
           <label>School <input required name="school" placeholder="School name"></label>
           <label>Grade level <input required name="grade_level" placeholder="Example: Grade 4"></label>
@@ -1133,6 +1170,7 @@ class App(BaseHTTPRequestHandler):
         self.require_permission("manage_students")
         try:
             form = self.form_fields()
+            student_number = self.val(form, "student_number")
             name = self.val(form, "name")
             school = self.val(form, "school")
             grade_level = self.val(form, "grade_level")
@@ -1145,8 +1183,8 @@ class App(BaseHTTPRequestHandler):
             photo_id = self.save_file(photo_field, "profile_photo", self.user["id"])
             with db() as conn:
                 student_id = conn.execute(
-                    "INSERT INTO students (name,school,grade_level,age,birthdate,sex,profile_photo_file_id,active,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (name, school, grade_level, age, birthdate, sex, photo_id, 1 if self.val(form, "active") else 0, now()),
+                    "INSERT INTO students (student_number,name,school,grade_level,age,birthdate,sex,profile_photo_file_id,active,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (student_number, name, school, grade_level, age, birthdate, sex, photo_id, 1 if self.val(form, "active") else 0, now()),
                 ).lastrowid
             return self.redirect(f"/students/{student_id}")
         except ValueError as exc:
@@ -1207,6 +1245,7 @@ class App(BaseHTTPRequestHandler):
         <form class="panel form" method="post" enctype="multipart/form-data">
           {f'<p class="alert">{escape(message)}</p>' if message else ''}
           <p class="hint">Update the student record. Choose a new profile photo only if you want to replace the current one.</p>
+          <label>ID Number <input name="student_number" value="{escape(student["student_number"] or "")}" placeholder="Example: MH-00123"></label>
           <label>Name <input required name="name" value="{escape(student["name"])}"></label>
           <label>School <input required name="school" value="{escape(student["school"])}"></label>
           <label>Grade level <input required name="grade_level" value="{escape(student["grade_level"])}"></label>
@@ -1225,6 +1264,7 @@ class App(BaseHTTPRequestHandler):
         self.require_permission("manage_students")
         try:
             form = self.form_fields()
+            student_number = self.val(form, "student_number")
             name = self.val(form, "name")
             school = self.val(form, "school")
             grade_level = self.val(form, "grade_level")
@@ -1240,8 +1280,8 @@ class App(BaseHTTPRequestHandler):
                 if not student:
                     return self.not_found()
                 conn.execute(
-                    "UPDATE students SET name=?, school=?, grade_level=?, age=?, birthdate=?, sex=?, active=? WHERE id=?",
-                    (name, school, grade_level, age, birthdate, sex, 1 if self.val(form, "active") else 0, student_id),
+                    "UPDATE students SET student_number=?, name=?, school=?, grade_level=?, age=?, birthdate=?, sex=?, active=? WHERE id=?",
+                    (student_number, name, school, grade_level, age, birthdate, sex, 1 if self.val(form, "active") else 0, student_id),
                 )
                 old_photo_id = student["profile_photo_file_id"]
                 if new_photo_id:
@@ -1294,8 +1334,28 @@ class App(BaseHTTPRequestHandler):
     def sponsors_index(self):
         self.require_permission("manage_sponsors")
         message = self.query.get("message", [""])[0]
+        q = self.search_query()
         with db() as conn:
-            sponsors = conn.execute("SELECT * FROM sponsors ORDER BY name").fetchall()
+            params = []
+            where = ""
+            if q:
+                where = """
+                WHERE LOWER(sp.name) LIKE ?
+                   OR LOWER(sp.email) LIKE ?
+                   OR LOWER(COALESCE(sp.phone,'')) LIKE ?
+                   OR EXISTS (
+                        SELECT 1 FROM sponsor_contacts sc
+                         WHERE sc.sponsor_id=sp.id AND LOWER(sc.value) LIKE ?
+                   )
+                   OR EXISTS (
+                        SELECT 1 FROM sponsor_students ss
+                        JOIN students st ON st.id=ss.student_id
+                         WHERE ss.sponsor_id=sp.id
+                           AND (LOWER(st.name) LIKE ? OR LOWER(COALESCE(st.student_number,'')) LIKE ?)
+                   )
+                """
+                params = [self.search_like(q)] * 6
+            sponsors = conn.execute(f"SELECT * FROM sponsors sp {where} ORDER BY sp.name", params).fetchall()
             links = conn.execute("SELECT ss.sponsor_id, st.name FROM sponsor_students ss JOIN students st ON st.id=ss.student_id ORDER BY st.name").fetchall()
             contacts = conn.execute("SELECT sponsor_id, kind, value FROM sponsor_contacts ORDER BY kind, value").fetchall()
         names = {}
@@ -1311,7 +1371,8 @@ class App(BaseHTTPRequestHandler):
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Records</p><h1>Sponsors</h1></div><a class="button primary" href="/sponsors/new">Add sponsor</a></header>
         {f'<p class="notice">{escape(message)}</p>' if message else ''}
-        <div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Notify by</th><th>Linked students</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="6">No sponsors yet.</td></tr>'}</tbody></table></div>
+        {self.search_form("/sponsors", q, "Search sponsors by name, email, phone, student, or student ID")}
+        <div class="tablewrap"><table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Notify by</th><th>Linked students</th><th></th></tr></thead><tbody>{rows or f'<tr><td colspan="6">{"No matching sponsors found." if q else "No sponsors yet."}</td></tr>'}</tbody></table></div>
         """
         return self.send_html(self.layout("Sponsors", body))
 
@@ -1345,11 +1406,15 @@ class App(BaseHTTPRequestHandler):
     def textarea_value(self, values):
         return escape("\n".join(values))
 
+    def student_option_label(self, student):
+        number = f'{student["student_number"]} - ' if "student_number" in student.keys() and student["student_number"] else ""
+        return f'{number}{student["name"]}'
+
     def sponsor_new_get(self):
         self.require_permission("manage_sponsors")
         with db() as conn:
             students = conn.execute("SELECT * FROM students WHERE active=1 ORDER BY name").fetchall()
-        options = "".join(f'<label class="check"><input type="checkbox" name="student_ids" value="{s["id"]}"> {escape(s["name"])}</label>' for s in students)
+        options = "".join(f'<label class="check"><input type="checkbox" name="student_ids" value="{s["id"]}"> {escape(self.student_option_label(s))}</label>' for s in students)
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor records</p><h1>Add sponsor</h1></div></header>
         <form class="panel form" method="post">
@@ -1419,7 +1484,7 @@ class App(BaseHTTPRequestHandler):
             additional_emails = self.sponsor_contact_values(conn, sponsor_id, "email")
             additional_phones = self.sponsor_contact_values(conn, sponsor_id, "phone")
         options = "".join(
-            f'<label class="check"><input type="checkbox" name="student_ids" value="{s["id"]}" {"checked" if s["id"] in linked else ""}> {escape(s["name"])} <span class="muted">{escape(s["grade_level"])}</span></label>'
+            f'<label class="check"><input type="checkbox" name="student_ids" value="{s["id"]}" {"checked" if s["id"] in linked else ""}> {escape(self.student_option_label(s))} <span class="muted">{escape(s["grade_level"])}</span></label>'
             for s in students
         )
         body = f"""
@@ -1724,7 +1789,7 @@ class App(BaseHTTPRequestHandler):
         selected = self.query.get("student_id", [""])[0]
         with db() as conn:
             students = conn.execute("SELECT * FROM students WHERE active=1 ORDER BY name").fetchall()
-        options = "".join(f'<option value="{s["id"]}" {"selected" if str(s["id"]) == selected else ""}>{escape(s["name"])}</option>' for s in students)
+        options = "".join(f'<option value="{s["id"]}" {"selected" if str(s["id"]) == selected else ""}>{escape(self.student_option_label(s))}</option>' for s in students)
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Draft first</p><h1>Create student update</h1></div></header>
         <form class="panel form" method="post" enctype="multipart/form-data">
