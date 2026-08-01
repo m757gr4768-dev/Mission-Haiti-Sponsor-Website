@@ -5,8 +5,11 @@ import html
 import hmac
 import hashlib
 import os
+import ipaddress
+import mimetypes
 import secrets
 import shutil
+import socket
 import smtplib
 import sqlite3
 import ssl
@@ -835,6 +838,52 @@ class App(BaseHTTPRequestHandler):
                 (update_id, kind, original, storage_name, content_type, size, uploaded_by, now()),
             ).lastrowid
 
+    def save_import_url(self, conn, url, kind, uploaded_by, update_id):
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(f"Media URL must start with http:// or https://: {url}")
+        self.validate_import_host(parsed.hostname)
+        original = Path(urllib.parse.unquote(parsed.path)).name or f"{kind}-upload"
+        storage_name = secrets.token_urlsafe(24)
+        target = UPLOAD_DIR / storage_name
+        request = urllib.request.Request(url, headers={"User-Agent": "MissionHaitiBulkImporter/1.0"})
+        size = 0
+        content_type = mimetypes.guess_type(original)[0] or "application/octet-stream"
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response, target.open("wb") as out:
+                response_type = response.headers.get_content_type()
+                if response_type and response_type != "text/html":
+                    content_type = response_type
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        target.unlink(missing_ok=True)
+                        raise ValueError(f"Media file is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB: {url}")
+                    out.write(chunk)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        return conn.execute(
+            "INSERT INTO update_files (update_id,kind,original_name,storage_name,content_type,size_bytes,uploaded_by,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (update_id, kind, original, storage_name, content_type, size, uploaded_by, now()),
+        ).lastrowid, storage_name
+
+    def validate_import_host(self, hostname):
+        lowered = hostname.lower()
+        if lowered in ("localhost", "127.0.0.1", "::1") or lowered.endswith(".local"):
+            raise ValueError("Media URLs cannot point to local or private hosts.")
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror as exc:
+            raise ValueError(f"Could not resolve media URL host {hostname}: {exc}")
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise ValueError("Media URLs cannot point to local or private network addresses.")
+
     def create_password_token(self, conn, user_id, purpose):
         token = secrets.token_urlsafe(40)
         conn.execute(
@@ -1120,12 +1169,12 @@ class App(BaseHTTPRequestHandler):
             raise PermissionError()
         cards = []
         if self.has_permission("manage_students"):
-            cards.append(self.bulk_card("students", "Students", "Add or update student records with ID Number, school, grade, age, birthdate, sex, and active status."))
+            cards.append(self.bulk_card("students", "Bulk add students", "Add or update student records with ID Number, school, grade, age, birthdate, sex, and active status."))
         if self.has_permission("manage_sponsors"):
-            cards.append(self.bulk_card("sponsors", "Sponsors", "Add or update sponsor records, extra emails/phones, notification preference, and linked student ID numbers."))
-            cards.append(self.bulk_card("sponsor-updates", "Sponsor Updates", "Bulk update existing sponsor contact information, notification preference, and linked student ID numbers."))
+            cards.append(self.bulk_card("sponsors", "Bulk add sponsors", "Add or update sponsor records, extra emails/phones, notification preference, and linked student ID numbers."))
+            cards.append(self.bulk_card("sponsor-updates", "Sponsor Updates", "Bulk update existing sponsor contact information, notification preference, and linked student ID numbers. The template also includes photo/video URL columns for future sponsor-message tracking."))
         if self.has_permission("create_updates"):
-            cards.append(self.bulk_card("student-updates", "Student Updates", "Create draft, pending, or approved written student updates from a CSV. Notifications are sent only when the row says to notify."))
+            cards.append(self.bulk_card("student-updates", "Student Updates", "Create draft, pending, or approved written student updates from a CSV, with optional report card, photo, and video URLs. Notifications are sent only when the row says to notify."))
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Admin tools</p><h1>Bulk import</h1></div></header>
         {result}
@@ -1162,12 +1211,12 @@ class App(BaseHTTPRequestHandler):
                 ["Demo Sponsor", "sponsor@example.com", "+16055551234", "email_sms", "spouse@example.com;grandparent@example.com", "+16055559876", "MH-00123;MH-00456", "no"],
             ],
             "sponsor-updates": [
-                ["primary_email", "name", "primary_phone", "notification_preference", "additional_emails", "additional_phones", "linked_student_ids"],
-                ["sponsor@example.com", "Demo Sponsor", "+16055551234", "email_sms", "spouse@example.com", "+16055559876", "MH-00123;MH-00456"],
+                ["primary_email", "name", "primary_phone", "notification_preference", "additional_emails", "additional_phones", "linked_student_ids", "photo_urls", "video_urls"],
+                ["sponsor@example.com", "Demo Sponsor", "+16055551234", "email_sms", "spouse@example.com", "+16055559876", "MH-00123;MH-00456", "", ""],
             ],
             "student-updates": [
-                ["student_number", "student_name", "note", "status", "notify_sponsors"],
-                ["MH-00123", "Marie Joseph", "Marie is doing well in school this month.", "draft", "no"],
+                ["student_number", "student_name", "note", "status", "notify_sponsors", "report_card_url", "photo_urls", "video_urls"],
+                ["MH-00123", "Marie Joseph", "Marie is doing well in school this month.", "draft", "no", "", "", ""],
             ],
         }
         rows = templates.get(kind)
@@ -1389,12 +1438,26 @@ class App(BaseHTTPRequestHandler):
                     result["errors"].append(f'Row {row["_row"]}: {exc}')
         return result
 
+    def attach_student_update_import_files(self, conn, row, update_id, storage_names):
+        report_card_url = self.row_value(row, "report_card_url", "grades_url", "report_card")
+        if report_card_url:
+            _, storage_name = self.save_import_url(conn, report_card_url, "report_card", self.user["id"], update_id)
+            storage_names.append(storage_name)
+        for photo_url in self.split_cell(self.row_value(row, "photo_urls", "photos")):
+            _, storage_name = self.save_import_url(conn, photo_url, "photo", self.user["id"], update_id)
+            storage_names.append(storage_name)
+        for video_url in self.split_cell(self.row_value(row, "video_urls", "videos")):
+            _, storage_name = self.save_import_url(conn, video_url, "video", self.user["id"], update_id)
+            storage_names.append(storage_name)
+
     def import_student_updates(self, rows):
         self.require_permission("create_updates")
         result = {"title": "Student update import complete", "created": 0, "updated": 0, "skipped": 0, "errors": []}
         with db() as conn:
             for row in rows:
+                storage_names = []
                 try:
+                    conn.execute("SAVEPOINT bulk_update_row")
                     student_number = self.row_value(row, "student_number", "student_id", "id_number")
                     student_name = self.row_value(row, "student_name", "name")
                     note = self.row_value(row, "note", "written_note", "update")
@@ -1414,11 +1477,16 @@ class App(BaseHTTPRequestHandler):
                         "INSERT INTO updates (student_id,note,status,created_by,approved_by,created_at,submitted_at,approved_at) VALUES (?,?,?,?,?,?,?,?)",
                         (student["id"], note, status, self.user["id"], approved_by, created_at, submitted_at, approved_at),
                     ).lastrowid
+                    self.attach_student_update_import_files(conn, row, update_id, storage_names)
                     result["created"] += 1
                     if status == "approved" and self.truthy_cell(self.row_value(row, "notify_sponsors")):
                         update = conn.execute("SELECT u.*, s.name student_name FROM updates u JOIN students s ON s.id=u.student_id WHERE u.id=?", (update_id,)).fetchone()
                         self.send_update_notifications(conn, update)
+                    conn.execute("RELEASE SAVEPOINT bulk_update_row")
                 except Exception as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT bulk_update_row")
+                    conn.execute("RELEASE SAVEPOINT bulk_update_row")
+                    self.delete_storage_files(storage_names)
                     result["skipped"] += 1
                     result["errors"].append(f'Row {row["_row"]}: {exc}')
         return result
