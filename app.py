@@ -273,6 +273,14 @@ def init_db():
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
+            CREATE TABLE IF NOT EXISTS sponsor_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sponsor_id INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('email','phone')),
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(sponsor_id) REFERENCES sponsors(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS sponsor_students (
                 sponsor_id INTEGER NOT NULL,
                 student_id INTEGER NOT NULL,
@@ -737,6 +745,26 @@ class App(BaseHTTPRequestHandler):
             fields = form[name] if isinstance(form[name], list) else [form[name]]
             return [f.value for f in fields if not f.filename and f.value]
         return form.get(name, [])
+
+    def contact_lines(self, form, name, lower=False):
+        raw = self.val(form, name)
+        values = []
+        for line in raw.replace(",", "\n").splitlines():
+            value = line.strip()
+            if value:
+                values.append(value.lower() if lower else value)
+        return self.unique_values(values)
+
+    def unique_values(self, values):
+        seen = set()
+        unique = []
+        for value in values:
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(value)
+        return unique
 
     def optional_int(self, value, label):
         if not value:
@@ -1269,11 +1297,15 @@ class App(BaseHTTPRequestHandler):
         with db() as conn:
             sponsors = conn.execute("SELECT * FROM sponsors ORDER BY name").fetchall()
             links = conn.execute("SELECT ss.sponsor_id, st.name FROM sponsor_students ss JOIN students st ON st.id=ss.student_id ORDER BY st.name").fetchall()
+            contacts = conn.execute("SELECT sponsor_id, kind, value FROM sponsor_contacts ORDER BY kind, value").fetchall()
         names = {}
         for link in links:
             names.setdefault(link["sponsor_id"], []).append(link["name"])
+        contact_map = {}
+        for contact in contacts:
+            contact_map.setdefault(contact["sponsor_id"], {}).setdefault(contact["kind"], []).append(contact["value"])
         rows = "".join(
-            f'<tr><td>{escape(s["name"])}</td><td>{escape(s["email"])}</td><td>{escape(s["phone"] or "")}</td><td>{escape(self.notification_label(s["notification_preference"]))}</td><td>{escape(", ".join(names.get(s["id"], [])))}</td><td><div class="actions"><a class="button" href="/sponsors/{s["id"]}/edit">Edit</a><form method="post" action="/sponsors/{s["id"]}/invite"><button>Send password link</button></form><form method="post" action="/sponsors/{s["id"]}/delete"><button class="danger">Remove</button></form></div></td></tr>'
+            f'<tr><td>{escape(s["name"])}</td><td>{self.contact_display([s["email"]] + contact_map.get(s["id"], {}).get("email", []))}</td><td>{self.contact_display(([s["phone"]] if s["phone"] else []) + contact_map.get(s["id"], {}).get("phone", []))}</td><td>{escape(self.notification_label(s["notification_preference"]))}</td><td>{escape(", ".join(names.get(s["id"], [])))}</td><td><div class="actions"><a class="button" href="/sponsors/{s["id"]}/edit">Edit</a><form method="post" action="/sponsors/{s["id"]}/invite"><button>Send password link</button></form><form method="post" action="/sponsors/{s["id"]}/delete"><button class="danger">Remove</button></form></div></td></tr>'
             for s in sponsors
         )
         body = f"""
@@ -1283,12 +1315,35 @@ class App(BaseHTTPRequestHandler):
         """
         return self.send_html(self.layout("Sponsors", body))
 
+    def contact_display(self, values):
+        values = self.unique_values([value for value in values if value])
+        return "<br>".join(escape(value) for value in values) or '<span class="muted">None</span>'
+
     def notification_label(self, preference):
         return {"email": "Email", "sms": "SMS", "email_sms": "Email + SMS"}.get(preference or "email", "Email")
 
     def notification_options(self, selected="email"):
         options = (("email", "Email only"), ("sms", "SMS only"), ("email_sms", "Email + SMS"))
         return "".join(f'<option value="{value}" {"selected" if selected == value else ""}>{label}</option>' for value, label in options)
+
+    def sponsor_contact_values(self, conn, sponsor_id, kind):
+        rows = conn.execute(
+            "SELECT value FROM sponsor_contacts WHERE sponsor_id=? AND kind=? ORDER BY value",
+            (sponsor_id, kind),
+        ).fetchall()
+        return [row["value"] for row in rows]
+
+    def replace_sponsor_contacts(self, conn, sponsor_id, emails, phones):
+        conn.execute("DELETE FROM sponsor_contacts WHERE sponsor_id=?", (sponsor_id,))
+        for kind, values in (("email", emails), ("phone", phones)):
+            for value in values:
+                conn.execute(
+                    "INSERT INTO sponsor_contacts (sponsor_id,kind,value,created_at) VALUES (?,?,?,?)",
+                    (sponsor_id, kind, value, now()),
+                )
+
+    def textarea_value(self, values):
+        return escape("\n".join(values))
 
     def sponsor_new_get(self):
         self.require_permission("manage_sponsors")
@@ -1299,10 +1354,12 @@ class App(BaseHTTPRequestHandler):
         <header class="pagehead"><div><p class="eyebrow">Sponsor records</p><h1>Add sponsor</h1></div></header>
         <form class="panel form" method="post">
           <label>Name <input required name="name"></label>
-          <label>Email <input required type="email" name="email"></label>
-          <label>Phone for SMS <input type="tel" name="phone" placeholder="+16055551234"></label>
+          <label>Primary email <input required type="email" name="email"></label>
+          <label>Additional emails <textarea name="additional_emails" rows="3" placeholder="one@email.com&#10;two@email.com"></textarea></label>
+          <label>Primary phone for SMS <input type="tel" name="phone" placeholder="+16055551234"></label>
+          <label>Additional phones for SMS <textarea name="additional_phones" rows="3" placeholder="+16055551234&#10;+16055559876"></textarea></label>
           <label>Update notifications <select name="notification_preference">{self.notification_options()}</select></label>
-          <p class="hint">Use international format for SMS, like +16055551234. Only send texts to sponsors who have agreed to receive them.</p>
+          <p class="hint">Additional contacts receive update notifications too. Sponsors sign in with the primary email. Use international format for SMS, like +16055551234, and only text sponsors who have agreed to receive texts.</p>
           <label class="check"><input type="checkbox" name="send_invite" checked> Email this sponsor a secure password setup link</label>
           <fieldset><legend>Linked students</legend>{options or '<p class="muted">Add students first.</p>'}</fieldset>
           <button class="primary">Save sponsor</button>
@@ -1315,10 +1372,14 @@ class App(BaseHTTPRequestHandler):
         form = self.form_fields()
         name, email = self.val(form, "name"), self.val(form, "email").lower()
         phone = self.val(form, "phone")
+        additional_emails = [value for value in self.contact_lines(form, "additional_emails", lower=True) if value != email]
+        additional_phones = [value for value in self.contact_lines(form, "additional_phones") if value != phone]
         notification_preference = self.val(form, "notification_preference") or "email"
         send_invite = bool(self.val(form, "send_invite"))
         if not name or not email:
             return self.sponsor_new_get()
+        if any("@" not in value for value in [email] + additional_emails):
+            return self.error_page(HTTPStatus.BAD_REQUEST, "Please enter valid email addresses.")
         if notification_preference not in ("email", "sms", "email_sms"):
             return self.error_page(HTTPStatus.BAD_REQUEST, "Please choose a valid notification preference.")
         try:
@@ -1331,6 +1392,7 @@ class App(BaseHTTPRequestHandler):
                     "INSERT INTO sponsors (name,email,phone,notification_preference,user_id,created_at) VALUES (?,?,?,?,?,?)",
                     (name, email, phone, notification_preference, user_id, now()),
                 ).lastrowid
+                self.replace_sponsor_contacts(conn, sponsor_id, additional_emails, additional_phones)
                 conn.execute("UPDATE users SET sponsor_id=? WHERE id=?", (sponsor_id, user_id))
                 for student_id in self.vals(form, "student_ids"):
                     conn.execute("INSERT OR IGNORE INTO sponsor_students (sponsor_id,student_id) VALUES (?,?)", (sponsor_id, int(student_id)))
@@ -1354,6 +1416,8 @@ class App(BaseHTTPRequestHandler):
                 return self.not_found()
             students = conn.execute("SELECT * FROM students ORDER BY active DESC, name").fetchall()
             linked = {row["student_id"] for row in conn.execute("SELECT student_id FROM sponsor_students WHERE sponsor_id=?", (sponsor_id,)).fetchall()}
+            additional_emails = self.sponsor_contact_values(conn, sponsor_id, "email")
+            additional_phones = self.sponsor_contact_values(conn, sponsor_id, "phone")
         options = "".join(
             f'<label class="check"><input type="checkbox" name="student_ids" value="{s["id"]}" {"checked" if s["id"] in linked else ""}> {escape(s["name"])} <span class="muted">{escape(s["grade_level"])}</span></label>'
             for s in students
@@ -1363,10 +1427,12 @@ class App(BaseHTTPRequestHandler):
         <form class="panel form" method="post">
           {f'<p class="alert">{escape(message)}</p>' if message else ''}
           <label>Name <input required name="name" value="{escape(sponsor["name"])}"></label>
-          <label>Email <input required type="email" name="email" value="{escape(sponsor["email"])}"></label>
-          <label>Phone for SMS <input type="tel" name="phone" value="{escape(sponsor["phone"] or "")}" placeholder="+16055551234"></label>
+          <label>Primary email <input required type="email" name="email" value="{escape(sponsor["email"])}"></label>
+          <label>Additional emails <textarea name="additional_emails" rows="3" placeholder="one@email.com&#10;two@email.com">{self.textarea_value(additional_emails)}</textarea></label>
+          <label>Primary phone for SMS <input type="tel" name="phone" value="{escape(sponsor["phone"] or "")}" placeholder="+16055551234"></label>
+          <label>Additional phones for SMS <textarea name="additional_phones" rows="3" placeholder="+16055551234&#10;+16055559876">{self.textarea_value(additional_phones)}</textarea></label>
           <label>Update notifications <select name="notification_preference">{self.notification_options(sponsor["notification_preference"])}</select></label>
-          <p class="hint">Use international format for SMS, like +16055551234. Only send texts to sponsors who have agreed to receive them.</p>
+          <p class="hint">Additional contacts receive update notifications too. Sponsors sign in with the primary email. Use international format for SMS, like +16055551234, and only text sponsors who have agreed to receive texts.</p>
           <label>New password <input name="password" placeholder="Leave blank to keep current password"></label>
           <p class="hint">Use "Send password link" on the sponsor list when you want the sponsor to set their own password by email.</p>
           <fieldset><legend>Linked students</legend>{options or '<p class="muted">Add students first.</p>'}</fieldset>
@@ -1381,11 +1447,15 @@ class App(BaseHTTPRequestHandler):
         name = self.val(form, "name")
         email = self.val(form, "email").lower()
         phone = self.val(form, "phone")
+        additional_emails = [value for value in self.contact_lines(form, "additional_emails", lower=True) if value != email]
+        additional_phones = [value for value in self.contact_lines(form, "additional_phones") if value != phone]
         notification_preference = self.val(form, "notification_preference") or "email"
         password = self.val(form, "password")
         student_ids = [int(student_id) for student_id in self.vals(form, "student_ids")]
         if not name or not email:
             return self.sponsor_edit_get(sponsor_id, "Please add the sponsor name and email.")
+        if any("@" not in value for value in [email] + additional_emails):
+            return self.sponsor_edit_get(sponsor_id, "Please enter valid email addresses.")
         if notification_preference not in ("email", "sms", "email_sms"):
             return self.sponsor_edit_get(sponsor_id, "Please choose a valid notification preference.")
         try:
@@ -1397,6 +1467,7 @@ class App(BaseHTTPRequestHandler):
                     "UPDATE sponsors SET name=?, email=?, phone=?, notification_preference=? WHERE id=?",
                     (name, email, phone, notification_preference, sponsor_id),
                 )
+                self.replace_sponsor_contacts(conn, sponsor_id, additional_emails, additional_phones)
                 if sponsor["user_id"]:
                     conn.execute("UPDATE users SET name=?, email=? WHERE id=?", (name, email, sponsor["user_id"]))
                     if password:
@@ -1428,6 +1499,7 @@ class App(BaseHTTPRequestHandler):
                 conn.execute("DELETE FROM email_notifications WHERE sponsor_id=?", (sponsor_id,))
                 conn.execute("DELETE FROM sms_notifications WHERE sponsor_id=?", (sponsor_id,))
                 conn.execute("DELETE FROM sponsor_students WHERE sponsor_id=?", (sponsor_id,))
+                conn.execute("DELETE FROM sponsor_contacts WHERE sponsor_id=?", (sponsor_id,))
                 conn.execute("DELETE FROM sponsors WHERE id=?", (sponsor_id,))
                 if sponsor["user_id"]:
                     conn.execute("DELETE FROM users WHERE id=? AND role='sponsor'", (sponsor["user_id"],))
@@ -1826,6 +1898,10 @@ class App(BaseHTTPRequestHandler):
         for sponsor in sponsors:
             portal_link = f"{APP_BASE_URL}/portal/students/{update['student_id']}"
             preference = sponsor["notification_preference"] or "email"
+            additional_emails = self.sponsor_contact_values(conn, sponsor["id"], "email")
+            additional_phones = self.sponsor_contact_values(conn, sponsor["id"], "phone")
+            recipient_emails = self.unique_values([sponsor["email"]] + additional_emails)
+            recipient_phones = self.unique_values(([sponsor["phone"]] if sponsor["phone"] else []) + additional_phones)
             if preference in ("email", "email_sms"):
                 subject = f"New Mission-Haiti update for {update['student_name']}"
                 body = (
@@ -1836,18 +1912,22 @@ class App(BaseHTTPRequestHandler):
                     "For privacy, please do not forward this link. You will need to sign in to view the update.\n\n"
                     "Mission-Haiti"
                 )
-                status, provider_message = send_email(sponsor["email"], subject, body)
-                conn.execute(
-                    "INSERT INTO email_notifications (update_id,sponsor_id,recipient_email,subject,body,sent_at,status,provider_message,attempted_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (update["id"], sponsor["id"], sponsor["email"], subject, body, now(), status, provider_message, now()),
-                )
+                for recipient_email in recipient_emails:
+                    status, provider_message = send_email(recipient_email, subject, body)
+                    conn.execute(
+                        "INSERT INTO email_notifications (update_id,sponsor_id,recipient_email,subject,body,sent_at,status,provider_message,attempted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (update["id"], sponsor["id"], recipient_email, subject, body, now(), status, provider_message, now()),
+                    )
             if preference in ("sms", "email_sms"):
                 sms_body = f"Mission-Haiti: A new student update is available. Sign in securely: {portal_link}"
-                status, provider_message = send_sms(sponsor["phone"] or "", sms_body)
-                conn.execute(
-                    "INSERT INTO sms_notifications (update_id,sponsor_id,recipient_phone,body,sent_at,status,provider_message,attempted_at) VALUES (?,?,?,?,?,?,?,?)",
-                    (update["id"], sponsor["id"], sponsor["phone"] or "", sms_body, now(), status, provider_message, now()),
-                )
+                if not recipient_phones:
+                    recipient_phones = [""]
+                for recipient_phone in recipient_phones:
+                    status, provider_message = send_sms(recipient_phone, sms_body)
+                    conn.execute(
+                        "INSERT INTO sms_notifications (update_id,sponsor_id,recipient_phone,body,sent_at,status,provider_message,attempted_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (update["id"], sponsor["id"], recipient_phone, sms_body, now(), status, provider_message, now()),
+                    )
 
     def portal_student(self, student_id):
         if not self.sponsor_can_view_student(student_id, approved_only=False):
