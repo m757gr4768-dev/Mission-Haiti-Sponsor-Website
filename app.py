@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import csv
 import html
 import hmac
 import hashlib
@@ -19,7 +20,7 @@ from email.policy import default as email_policy
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -504,6 +505,12 @@ class App(BaseHTTPRequestHandler):
                 return self.admin_invite_post(int(self.path_only.split("/")[-2]))
             if self.path_only.startswith("/admins/") and self.path_only.endswith("/delete") and method == "POST":
                 return self.admin_delete_post(int(self.path_only.split("/")[-2]))
+            if self.path_only == "/bulk" and method == "GET":
+                return self.bulk_imports_get()
+            if self.path_only.startswith("/bulk/template/") and method == "GET":
+                return self.bulk_template_get(self.path_only.split("/")[-1])
+            if self.path_only.startswith("/bulk/") and method == "POST":
+                return self.bulk_import_post(self.path_only.split("/")[-1])
             if self.path_only == "/updates/new":
                 return self.update_new_get() if method == "GET" else self.update_new_post()
             if self.path_only.startswith("/updates/"):
@@ -552,6 +559,12 @@ class App(BaseHTTPRequestHandler):
     def require_permission(self, permission):
         if not self.has_permission(permission):
             raise PermissionError()
+
+    def can_bulk_import(self):
+        return any(
+            self.has_permission(permission)
+            for permission in ("manage_students", "manage_sponsors", "create_updates")
+        )
 
     def permission_values(self, form, role):
         if role == "sponsor":
@@ -644,6 +657,8 @@ class App(BaseHTTPRequestHandler):
             links.append('<a href="/admins">Admins</a>')
         if self.has_permission("create_updates"):
             links.append('<a href="/updates/new">New update</a>')
+        if self.can_bulk_import():
+            links.append('<a href="/bulk">Bulk import</a>')
         return "".join(links)
 
     def public_page(self, title, body):
@@ -1099,6 +1114,314 @@ class App(BaseHTTPRequestHandler):
         <section class="grid">{cards or f'<p class="muted">{"No matching students found." if q else "No students are linked to your account yet."}</p>'}</section>
         """
         return self.send_html(self.layout("Sponsor portal", body))
+
+    def bulk_imports_get(self, result=""):
+        if not self.can_bulk_import():
+            raise PermissionError()
+        cards = []
+        if self.has_permission("manage_students"):
+            cards.append(self.bulk_card("students", "Students", "Add or update student records with ID Number, school, grade, age, birthdate, sex, and active status."))
+        if self.has_permission("manage_sponsors"):
+            cards.append(self.bulk_card("sponsors", "Sponsors", "Add or update sponsor records, extra emails/phones, notification preference, and linked student ID numbers."))
+            cards.append(self.bulk_card("sponsor-updates", "Sponsor Updates", "Bulk update existing sponsor contact information, notification preference, and linked student ID numbers."))
+        if self.has_permission("create_updates"):
+            cards.append(self.bulk_card("student-updates", "Student Updates", "Create draft, pending, or approved written student updates from a CSV. Notifications are sent only when the row says to notify."))
+        body = f"""
+        <header class="pagehead"><div><p class="eyebrow">Admin tools</p><h1>Bulk import</h1></div></header>
+        {result}
+        <section class="import-grid">{''.join(cards)}</section>
+        """
+        return self.send_html(self.layout("Bulk import", body))
+
+    def bulk_card(self, kind, title, description):
+        return f"""
+        <article class="panel import-card">
+          <h2>{escape(title)}</h2>
+          <p>{escape(description)}</p>
+          <p><a class="button" href="/bulk/template/{kind}.csv">Download CSV template</a></p>
+          <form method="post" action="/bulk/{kind}" enctype="multipart/form-data">
+            <label>CSV file <input required type="file" name="csv_file" accept=".csv,text/csv"></label>
+            <button class="primary">Import {escape(title)}</button>
+          </form>
+        </article>
+        """
+
+    def bulk_template_get(self, filename):
+        if not self.can_bulk_import():
+            raise PermissionError()
+        kind = filename.removesuffix(".csv")
+        if not self.bulk_allowed(kind):
+            raise PermissionError()
+        templates = {
+            "students": [
+                ["student_number", "name", "school", "grade_level", "age", "birthdate", "sex", "active"],
+                ["MH-00123", "Marie Joseph", "Mission-Haiti School", "Grade 5", "11", "2015-04-12", "Female", "yes"],
+            ],
+            "sponsors": [
+                ["name", "primary_email", "primary_phone", "notification_preference", "additional_emails", "additional_phones", "linked_student_ids", "send_invite"],
+                ["Demo Sponsor", "sponsor@example.com", "+16055551234", "email_sms", "spouse@example.com;grandparent@example.com", "+16055559876", "MH-00123;MH-00456", "no"],
+            ],
+            "sponsor-updates": [
+                ["primary_email", "name", "primary_phone", "notification_preference", "additional_emails", "additional_phones", "linked_student_ids"],
+                ["sponsor@example.com", "Demo Sponsor", "+16055551234", "email_sms", "spouse@example.com", "+16055559876", "MH-00123;MH-00456"],
+            ],
+            "student-updates": [
+                ["student_number", "student_name", "note", "status", "notify_sponsors"],
+                ["MH-00123", "Marie Joseph", "Marie is doing well in school this month.", "draft", "no"],
+            ],
+        }
+        rows = templates.get(kind)
+        if not rows:
+            return self.not_found()
+        out = StringIO()
+        writer = csv.writer(out)
+        writer.writerows(rows)
+        return self.send_csv(f"{kind}.csv", out.getvalue())
+
+    def send_csv(self, filename, content):
+        body = content.encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def bulk_import_post(self, kind):
+        if not self.bulk_allowed(kind):
+            raise PermissionError()
+        form = self.form_fields()
+        try:
+            rows = self.csv_rows_from_form(form)
+            if kind == "students":
+                result = self.import_students(rows)
+            elif kind == "sponsors":
+                result = self.import_sponsors(rows, update_only=False)
+            elif kind == "sponsor-updates":
+                result = self.import_sponsors(rows, update_only=True)
+            elif kind == "student-updates":
+                result = self.import_student_updates(rows)
+            else:
+                return self.not_found()
+        except ValueError as exc:
+            result = {"title": "Import failed", "created": 0, "updated": 0, "skipped": 0, "errors": [str(exc)]}
+        return self.bulk_imports_get(self.bulk_result_html(result))
+
+    def bulk_allowed(self, kind):
+        return (
+            (kind == "students" and self.has_permission("manage_students"))
+            or (kind in ("sponsors", "sponsor-updates") and self.has_permission("manage_sponsors"))
+            or (kind == "student-updates" and self.has_permission("create_updates"))
+        )
+
+    def csv_rows_from_form(self, form):
+        if not isinstance(form, MultipartForm) or "csv_file" not in form:
+            raise ValueError("Please choose a CSV file.")
+        field = form["csv_file"]
+        if isinstance(field, list):
+            field = field[0]
+        if not getattr(field, "filename", ""):
+            raise ValueError("Please choose a CSV file.")
+        raw = field.file.read()
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ValueError("The CSV file is too large.")
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ValueError("Please save the CSV as UTF-8 text.")
+        reader = csv.DictReader(StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("The CSV is missing a header row.")
+        rows = []
+        for index, row in enumerate(reader, start=2):
+            normalized = {(key or "").strip().lower(): (value or "").strip() for key, value in row.items()}
+            if any(normalized.values()):
+                normalized["_row"] = str(index)
+                rows.append(normalized)
+        if not rows:
+            raise ValueError("The CSV did not include any data rows.")
+        return rows
+
+    def bulk_result_html(self, result):
+        errors = "".join(f'<li>{escape(error)}</li>' for error in result.get("errors", []))
+        return f"""
+        <section class="panel">
+          <h2>{escape(result["title"])}</h2>
+          <p>Created: <b>{result.get("created", 0)}</b> · Updated: <b>{result.get("updated", 0)}</b> · Skipped: <b>{result.get("skipped", 0)}</b></p>
+          {f'<ul class="list">{errors}</ul>' if errors else '<p class="notice">No row errors.</p>'}
+        </section>
+        """
+
+    def row_value(self, row, *names):
+        for name in names:
+            value = row.get(name, "").strip()
+            if value:
+                return value
+        return ""
+
+    def split_cell(self, value):
+        return self.unique_values([part.strip() for part in value.replace("\n", ";").split(";") if part.strip()])
+
+    def truthy_cell(self, value):
+        return value.strip().lower() in ("1", "true", "yes", "y", "active", "send")
+
+    def find_student_for_import(self, conn, student_number, student_name):
+        if student_number:
+            rows = conn.execute("SELECT * FROM students WHERE LOWER(student_number)=?", (student_number.lower(),)).fetchall()
+            if len(rows) == 1:
+                return rows[0]
+            if len(rows) > 1:
+                raise ValueError(f"student_number {student_number} matches more than one student.")
+        if student_name:
+            rows = conn.execute("SELECT * FROM students WHERE LOWER(name)=?", (student_name.lower(),)).fetchall()
+            if len(rows) == 1:
+                return rows[0]
+            if len(rows) > 1:
+                raise ValueError(f"student_name {student_name} matches more than one student. Use student_number.")
+        raise ValueError("No matching student found.")
+
+    def student_ids_from_numbers(self, conn, numbers):
+        ids = []
+        for number in numbers:
+            student = self.find_student_for_import(conn, number, "")
+            ids.append(student["id"])
+        return ids
+
+    def import_students(self, rows):
+        self.require_permission("manage_students")
+        result = {"title": "Student import complete", "created": 0, "updated": 0, "skipped": 0, "errors": []}
+        with db() as conn:
+            for row in rows:
+                try:
+                    student_number = self.row_value(row, "student_number", "id_number", "id")
+                    name = self.row_value(row, "name", "student_name")
+                    school = self.row_value(row, "school")
+                    grade_level = self.row_value(row, "grade_level", "grade")
+                    if not name or not school or not grade_level:
+                        raise ValueError("name, school, and grade_level are required.")
+                    age = self.optional_int(self.row_value(row, "age"), "Age")
+                    birthdate = self.row_value(row, "birthdate", "birth_date")
+                    sex = self.row_value(row, "sex")
+                    active_value = self.row_value(row, "active")
+                    active = 1 if active_value == "" or self.truthy_cell(active_value) else 0
+                    existing = None
+                    if student_number:
+                        existing = conn.execute("SELECT * FROM students WHERE LOWER(student_number)=?", (student_number.lower(),)).fetchone()
+                    if not existing:
+                        existing = conn.execute("SELECT * FROM students WHERE LOWER(name)=? AND LOWER(school)=?", (name.lower(), school.lower())).fetchone()
+                    if existing:
+                        conn.execute(
+                            "UPDATE students SET student_number=?, name=?, school=?, grade_level=?, age=?, birthdate=?, sex=?, active=? WHERE id=?",
+                            (student_number, name, school, grade_level, age, birthdate, sex, active, existing["id"]),
+                        )
+                        result["updated"] += 1
+                    else:
+                        conn.execute(
+                            "INSERT INTO students (student_number,name,school,grade_level,age,birthdate,sex,active,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (student_number, name, school, grade_level, age, birthdate, sex, active, now()),
+                        )
+                        result["created"] += 1
+                except Exception as exc:
+                    result["skipped"] += 1
+                    result["errors"].append(f'Row {row["_row"]}: {exc}')
+        return result
+
+    def import_sponsors(self, rows, update_only=False):
+        self.require_permission("manage_sponsors")
+        result = {"title": "Sponsor update import complete" if update_only else "Sponsor import complete", "created": 0, "updated": 0, "skipped": 0, "errors": []}
+        with db() as conn:
+            for row in rows:
+                try:
+                    email = self.row_value(row, "primary_email", "email").lower()
+                    if not email or "@" not in email:
+                        raise ValueError("primary_email is required.")
+                    name = self.row_value(row, "name")
+                    phone = self.row_value(row, "primary_phone", "phone")
+                    preference = self.row_value(row, "notification_preference", "notify_by") or "email"
+                    if preference not in ("email", "sms", "email_sms"):
+                        raise ValueError("notification_preference must be email, sms, or email_sms.")
+                    additional_emails = [value.lower() for value in self.split_cell(self.row_value(row, "additional_emails")) if value.lower() != email]
+                    if any("@" not in value for value in additional_emails):
+                        raise ValueError("additional_emails contains an invalid email.")
+                    additional_phones = [value for value in self.split_cell(self.row_value(row, "additional_phones")) if value != phone]
+                    linked_numbers = self.split_cell(self.row_value(row, "linked_student_ids", "student_numbers", "student_ids"))
+                    student_ids = self.student_ids_from_numbers(conn, linked_numbers) if linked_numbers else None
+                    sponsor = conn.execute("SELECT * FROM sponsors WHERE LOWER(email)=?", (email,)).fetchone()
+                    if sponsor:
+                        updated_name = name or sponsor["name"]
+                        conn.execute(
+                            "UPDATE sponsors SET name=?, phone=?, notification_preference=? WHERE id=?",
+                            (updated_name, phone, preference, sponsor["id"]),
+                        )
+                        if sponsor["user_id"]:
+                            conn.execute("UPDATE users SET name=? WHERE id=?", (updated_name, sponsor["user_id"]))
+                        self.replace_sponsor_contacts(conn, sponsor["id"], additional_emails, additional_phones)
+                        if student_ids is not None:
+                            conn.execute("DELETE FROM sponsor_students WHERE sponsor_id=?", (sponsor["id"],))
+                            for student_id in student_ids:
+                                conn.execute("INSERT OR IGNORE INTO sponsor_students (sponsor_id,student_id) VALUES (?,?)", (sponsor["id"], student_id))
+                        result["updated"] += 1
+                    else:
+                        if update_only:
+                            raise ValueError("No sponsor exists with that primary_email.")
+                        if not name:
+                            raise ValueError("name is required for new sponsors.")
+                        user_id = conn.execute(
+                            "INSERT INTO users (name,email,password_hash,role,created_at) VALUES (?,?,?,?,?)",
+                            (name, email, hash_password(secrets.token_urlsafe(32)), "sponsor", now()),
+                        ).lastrowid
+                        sponsor_id = conn.execute(
+                            "INSERT INTO sponsors (name,email,phone,notification_preference,user_id,created_at) VALUES (?,?,?,?,?,?)",
+                            (name, email, phone, preference, user_id, now()),
+                        ).lastrowid
+                        conn.execute("UPDATE users SET sponsor_id=? WHERE id=?", (sponsor_id, user_id))
+                        self.replace_sponsor_contacts(conn, sponsor_id, additional_emails, additional_phones)
+                        if student_ids:
+                            for student_id in student_ids:
+                                conn.execute("INSERT OR IGNORE INTO sponsor_students (sponsor_id,student_id) VALUES (?,?)", (sponsor_id, student_id))
+                        result["created"] += 1
+                        if self.truthy_cell(self.row_value(row, "send_invite")):
+                            user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+                            self.send_password_link(conn, user, "invite")
+                except Exception as exc:
+                    result["skipped"] += 1
+                    result["errors"].append(f'Row {row["_row"]}: {exc}')
+        return result
+
+    def import_student_updates(self, rows):
+        self.require_permission("create_updates")
+        result = {"title": "Student update import complete", "created": 0, "updated": 0, "skipped": 0, "errors": []}
+        with db() as conn:
+            for row in rows:
+                try:
+                    student_number = self.row_value(row, "student_number", "student_id", "id_number")
+                    student_name = self.row_value(row, "student_name", "name")
+                    note = self.row_value(row, "note", "written_note", "update")
+                    status = self.row_value(row, "status") or "draft"
+                    if status not in ("draft", "pending", "approved"):
+                        raise ValueError("status must be draft, pending, or approved.")
+                    if not note:
+                        raise ValueError("note is required.")
+                    student = self.find_student_for_import(conn, student_number, student_name)
+                    created_at = now()
+                    submitted_at = created_at if status in ("pending", "approved") else None
+                    approved_at = created_at if status == "approved" else None
+                    approved_by = self.user["id"] if status == "approved" and self.has_permission("approve_updates") else None
+                    if status == "approved" and not self.has_permission("approve_updates"):
+                        raise ValueError("Only users with approval permission can bulk import approved updates.")
+                    update_id = conn.execute(
+                        "INSERT INTO updates (student_id,note,status,created_by,approved_by,created_at,submitted_at,approved_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (student["id"], note, status, self.user["id"], approved_by, created_at, submitted_at, approved_at),
+                    ).lastrowid
+                    result["created"] += 1
+                    if status == "approved" and self.truthy_cell(self.row_value(row, "notify_sponsors")):
+                        update = conn.execute("SELECT u.*, s.name student_name FROM updates u JOIN students s ON s.id=u.student_id WHERE u.id=?", (update_id,)).fetchone()
+                        self.send_update_notifications(conn, update)
+                except Exception as exc:
+                    result["skipped"] += 1
+                    result["errors"].append(f'Row {row["_row"]}: {exc}')
+        return result
 
     def student_card(self, student, portal=False):
         url = f"/portal/students/{student['id']}" if portal else f"/students/{student['id']}"

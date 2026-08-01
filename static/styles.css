@@ -208,6 +208,20 @@ textarea { resize: vertical; }
   align-items: center;
   margin: 0 0 18px;
 }
+.import-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px;
+}
+.import-card {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+.import-card form {
+  display: grid;
+  gap: 12px;
+}
 .check {
   display: flex;
   align-items: center;
