@@ -65,6 +65,11 @@ SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "false").lower() in ("1", "true", 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
+SPONSOR_MESSAGE_NOTIFY_EMAILS = [
+    email.strip().lower()
+    for email in os.environ.get("SPONSOR_MESSAGE_NOTIFY_EMAILS", "").replace(",", ";").split(";")
+    if email.strip()
+]
 PASSWORD_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
 ROLES = {"admin": "Admin", "staff": "Haiti staff", "sponsor": "Sponsor"}
@@ -2527,6 +2532,50 @@ class App(BaseHTTPRequestHandler):
         self.delete_storage_files([file["storage_name"] for file in files])
         return self.redirect("/sponsor-messages")
 
+    def send_sponsor_message_notifications(self, conn, message_id):
+        message = conn.execute(
+            """SELECT sm.*, sp.name sponsor_name, sp.email sponsor_email, st.name student_name, st.student_number
+               FROM sponsor_messages sm
+               JOIN sponsors sp ON sp.id=sm.sponsor_id
+               JOIN students st ON st.id=sm.student_id
+               WHERE sm.id=?""",
+            (message_id,),
+        ).fetchone()
+        if not message:
+            return
+        users = conn.execute(
+            """SELECT email FROM users
+               WHERE role IN ('admin','staff')
+                 AND (can_create_updates=1 OR can_approve_updates=1)"""
+        ).fetchall()
+        user_emails = [
+            user["email"].lower()
+            for user in users
+            if user["email"] and not user["email"].lower().endswith(".local")
+        ]
+        fallback_emails = []
+        if not user_emails and not SPONSOR_MESSAGE_NOTIFY_EMAILS and SMTP_FROM_EMAIL and not SMTP_FROM_EMAIL.lower().endswith(".local"):
+            fallback_emails.append(SMTP_FROM_EMAIL.lower())
+        recipients = self.unique_values(user_emails + SPONSOR_MESSAGE_NOTIFY_EMAILS + fallback_emails)
+        if not recipients:
+            print("SPONSOR MESSAGE EMAIL SKIPPED: no staff/admin notification recipients configured.")
+            return
+        student_label = message["student_name"]
+        if message["student_number"]:
+            student_label = f"{student_label} ({message['student_number']})"
+        subject = f"New sponsor message for {message['student_name']}"
+        detail_link = f"{APP_BASE_URL}/sponsor-messages/{message_id}"
+        body = (
+            "A sponsor sent a new message in the Mission-Haiti portal.\n\n"
+            f"Sponsor: {message['sponsor_name']} <{message['sponsor_email']}>\n"
+            f"Student: {student_label}\n\n"
+            "Sign in to review the message, photos, or videos:\n"
+            f"{detail_link}\n\n"
+            "Mission-Haiti"
+        )
+        for recipient in recipients:
+            send_email(recipient, subject, body)
+
     def portal_message_post(self, student_id):
         if self.user["role"] != "sponsor" or not self.sponsor_can_view_student(student_id, approved_only=False):
             raise PermissionError()
@@ -2549,6 +2598,8 @@ class App(BaseHTTPRequestHandler):
                             if fid:
                                 with db() as conn:
                                     conn.execute("UPDATE update_files SET sponsor_message_id=? WHERE id=?", (message_id, fid))
+            with db() as conn:
+                self.send_sponsor_message_notifications(conn, message_id)
             return self.redirect(f"/portal/students/{student_id}?message={urllib.parse.quote('Your message was sent to the Mission-Haiti team.')}")
         except ValueError as exc:
             return self.portal_student(student_id, str(exc))
