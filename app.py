@@ -2229,11 +2229,28 @@ class App(BaseHTTPRequestHandler):
     def update_new_get(self, message=""):
         self.require_permission("create_updates")
         selected = self.query.get("student_id", [""])[0]
+        q = self.search_query()
         with db() as conn:
-            students = conn.execute("SELECT * FROM students WHERE active=1 ORDER BY name").fetchall()
-        options = "".join(f'<option value="{s["id"]}" {"selected" if str(s["id"]) == selected else ""}>{escape(self.student_option_label(s))}</option>' for s in students)
+            params = []
+            where = "WHERE active=1"
+            if q:
+                like = self.search_like(q)
+                where += """
+                    AND (LOWER(name) LIKE ?
+                         OR LOWER(COALESCE(student_number,'')) LIKE ?
+                         OR LOWER(school) LIKE ?
+                         OR LOWER(grade_level) LIKE ?)"""
+                params.extend([like, like, like, like])
+            students = conn.execute(f"SELECT * FROM students {where} ORDER BY name", params).fetchall()
+        options = "".join(
+            f'<option value="{s["id"]}" {"selected" if str(s["id"]) == selected else ""}>{escape(self.student_option_label(s))} · {escape(s["school"])} · {escape(s["grade_level"])}</option>'
+            for s in students
+        )
+        if not options:
+            options = '<option value="">No matching active students found</option>'
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Draft first</p><h1>Create student update</h1></div></header>
+        {self.search_form("/updates/new", q, "Search students by name, ID number, grade, or school")}
         <form class="panel form" method="post" enctype="multipart/form-data">
           {f'<p class="alert">{escape(message)}</p>' if message else ''}
           <label>Student <select required name="student_id">{options}</select></label>
