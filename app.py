@@ -2685,20 +2685,20 @@ class App(BaseHTTPRequestHandler):
         </section>
         <section class="detail"><div class="panel">{self.student_card(student, portal=True)}</div><div class="panel"><h2>Student information</h2>{self.student_info_list(student)}</div></section>
         <section class="panel section-jump">
-          <h2>Messages</h2>
+          <h2>Coordinations Between You and Your Sponsor</h2>
           <div class="actions">
-            <a class="button primary" href="#messages-you-sent">Messages You've Sent</a>
+            <a class="button primary" href="#messages-you-sent">Send a Message to Your Sponsor</a>
             <a class="button" href="#messages-from-mission-haiti">Messages from Your Sponsor</a>
           </div>
         </section>
         <section id="messages-you-sent" class="panel">
-          <h2>Messages You've Sent</h2>
+          <h2>Send a message to your sponsor</h2>
           {f'<p class="notice">{escape(message)}</p>' if message and "sent" in message.lower() else f'<p class="alert">{escape(message)}</p>' if message else ''}
           <form class="form" method="post" action="/portal/students/{student_id}/messages" enctype="multipart/form-data">
-            <label>Message <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your student."></textarea></label>
-            <label>Pictures <input type="file" name="photos" accept="image/*" multiple></label>
-            <label>Videos <input type="file" name="videos" accept="video/*" multiple></label>
             <p class="hint">Uploads can include pictures and videos up to 250 MB total per message.</p>
+            <label>Send a Note <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your student."></textarea></label>
+            <label>Send a Picture <input type="file" name="photos" accept="image/*" multiple></label>
+            <label>Send a Video <input type="file" name="videos" accept="video/*" multiple></label>
             <p class="hint">The Mission-Haiti team reviews sponsor messages before sharing them with students in Haiti.</p>
             <button class="primary">Send message</button>
           </form>

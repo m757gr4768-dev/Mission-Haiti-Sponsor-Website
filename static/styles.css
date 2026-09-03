@@ -408,6 +408,14 @@ button,
 .section-jump {
   margin-bottom: 16px;
 }
+.section-jump h2,
+#messages-you-sent > h2,
+.sectionhead {
+  text-align: center;
+}
+.section-jump .actions {
+  justify-content: center;
+}
 .message-history {
   margin-top: 28px;
   padding-top: 20px;
