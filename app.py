@@ -114,6 +114,23 @@ class MultipartForm(dict):
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+def ordinal_day(day):
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def format_date_sent(value):
+    if not value:
+        return "Date Sent: Not listed"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return f"Date Sent: {value}"
+    return f"Date Sent: {parsed.strftime('%B')} {ordinal_day(parsed.day)} {parsed.year}"
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -2644,13 +2661,13 @@ class App(BaseHTTPRequestHandler):
         for update in updates:
             body_updates += f"""
             <article class="panel update">
-              <p class="eyebrow">{escape((update["approved_at"] or update["created_at"])[:10])}</p>
+              <p class="eyebrow">{escape(format_date_sent(update["approved_at"] or update["created_at"]))}</p>
               <p class="note">{escape(update["note"])}</p>
               {self.file_list(file_map.get(update["id"], []))}
             </article>
             """
         previous_messages = "".join(
-            f'<li>{escape(message_row["created_at"][:10])}: <span class="pill">{escape(message_row["status"])}</span> {escape(message_row["note"][:90])}</li>'
+            f'<li>{escape(format_date_sent(message_row["created_at"]))}: <span class="pill">{escape(message_row["status"])}</span> {escape(message_row["note"][:90])}</li>'
             for message_row in sponsor_messages
         )
         previous_messages_html = ""
