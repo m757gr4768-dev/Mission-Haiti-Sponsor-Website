@@ -2758,7 +2758,7 @@ class App(BaseHTTPRequestHandler):
           <h2>Coordinations Between You and Your Sponsor</h2>
           <div class="actions">
             <a class="button primary" href="#messages-you-sent">Send a Message to Your Student</a>
-            <a class="button" href="#messages-you-sent">Send a Message to Your Student</a>
+            <a class="button" href="#messages-from-mission-haiti">Messages from Your Student</a>
           </div>
         </section>
         <section id="messages-you-sent" class="panel">
@@ -2775,7 +2775,7 @@ class App(BaseHTTPRequestHandler):
           {previous_messages_html}
         </section>
         <section id="messages-from-mission-haiti">
-          <header class="sectionhead"><h2>Messages from Your Sponsor</h2><p class="eyebrow">Approved Mission-Haiti Staff Updates</p></header>
+          <header class="sectionhead"><h2>Messages from Your Student</h2><p class="eyebrow">Approved Mission-Haiti Staff Updates</p></header>
           {body_updates or '<div class="panel"><p class="muted">No approved updates yet.</p></div>'}
         </section>
         """
