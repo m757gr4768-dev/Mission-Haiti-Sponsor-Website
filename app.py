@@ -1206,7 +1206,6 @@ class App(BaseHTTPRequestHandler):
             ).fetchall()
         cards = "".join(self.student_card(s, portal=True) for s in students)
         bulk_message_form = self.portal_bulk_message_form(students, message) if len(students) > 1 else ""
-        bulk_message_jump = '<section class="panel section-jump"><div class="actions"><a class="button primary" href="#send-message-to-selected-students">Send message to selected students</a></div></section>' if bulk_message_form else ""
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor portal</p><h1>Your students</h1></div></header>
         <section class="mission-banner sponsor">
@@ -1219,9 +1218,8 @@ class App(BaseHTTPRequestHandler):
           </div>
         </section>
         {self.search_form("/dashboard", q, "Search your students by name, school, grade, or ID number")}
-        {bulk_message_jump}
-        {bulk_message_form}
         <section class="grid">{cards or f'<p class="muted">{"No matching students found." if q else "No students are linked to your account yet."}</p>'}</section>
+        {bulk_message_form}
         """
         return self.send_html(self.layout("Sponsor portal", body))
 
