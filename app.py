@@ -2697,10 +2697,13 @@ class App(BaseHTTPRequestHandler):
             label = FILE_KINDS.get(f["kind"], f["kind"])
             if f["content_type"].startswith("image/"):
                 preview = f'<img class="thumb" alt="" src="/files/{f["id"]}">'
+                display_name = "Photo"
             elif f["content_type"].startswith("video/"):
                 preview = f'<video class="thumb" controls preload="metadata" src="/files/{f["id"]}"></video>'
+                display_name = "Video"
             else:
                 preview = '<div class="fileicon">FILE</div>'
+                display_name = f["original_name"]
             remove = ""
             if self.user and (self.has_permission("create_updates") or self.has_permission("approve_updates")):
                 remove = f"""
@@ -2713,7 +2716,7 @@ class App(BaseHTTPRequestHandler):
               <a class="filelink" href="/files/{f["id"]}">
                 {preview}
                 <span>{escape(label)}</span>
-                <b>{escape(f["original_name"])}</b>
+                <b>{escape(display_name)}</b>
               </a>
               {remove}
             </div>
