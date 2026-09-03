@@ -581,6 +581,8 @@ class App(BaseHTTPRequestHandler):
                 return self.email_retry(int(self.path_only.split("/")[-2]))
             if self.path_only.startswith("/sms/") and self.path_only.endswith("/retry") and method == "POST":
                 return self.sms_retry(int(self.path_only.split("/")[-2]))
+            if self.path_only == "/portal/messages" and method == "POST":
+                return self.portal_bulk_message_post()
             if self.path_only.startswith("/portal/students/") and self.path_only.endswith("/messages") and method == "POST":
                 return self.portal_message_post(int(self.path_only.split("/")[-2]))
             if self.path_only.startswith("/portal/students/") and method == "GET":
@@ -1189,6 +1191,7 @@ class App(BaseHTTPRequestHandler):
 
     def sponsor_dashboard(self):
         q = self.search_query()
+        message = self.query.get("message", [""])[0]
         with db() as conn:
             params = [self.user["sponsor_id"]]
             where = "ss.sponsor_id=? AND st.active=1"
@@ -1202,6 +1205,7 @@ class App(BaseHTTPRequestHandler):
                 params,
             ).fetchall()
         cards = "".join(self.student_card(s, portal=True) for s in students)
+        bulk_message_form = self.portal_bulk_message_form(students, message) if len(students) > 1 else ""
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor portal</p><h1>Your students</h1></div></header>
         <section class="mission-banner sponsor">
@@ -1214,9 +1218,31 @@ class App(BaseHTTPRequestHandler):
           </div>
         </section>
         {self.search_form("/dashboard", q, "Search your students by name, school, grade, or ID number")}
+        {bulk_message_form}
         <section class="grid">{cards or f'<p class="muted">{"No matching students found." if q else "No students are linked to your account yet."}</p>'}</section>
         """
         return self.send_html(self.layout("Sponsor portal", body))
+
+    def portal_bulk_message_form(self, students, message=""):
+        options = "".join(
+            f'<label class="check"><input type="checkbox" name="student_ids" value="{student["id"]}"> {escape(self.student_option_label(student))}</label>'
+            for student in students
+        )
+        return f"""
+        <section class="panel">
+          <h2>Send one message to multiple students</h2>
+          {f'<p class="notice">{escape(message)}</p>' if message and "sent" in message.lower() else f'<p class="alert">{escape(message)}</p>' if message else ''}
+          <form class="form" method="post" action="/portal/messages" enctype="multipart/form-data">
+            <p class="hint">Choose the students who should receive this same encouragement. Mission-Haiti will review each message before sharing it in Haiti.</p>
+            <fieldset><legend>Students</legend>{options}</fieldset>
+            <p class="hint">Uploads can include pictures and videos up to 250 MB total per message.</p>
+            <label>Send a Note <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your students."></textarea></label>
+            <label>Send a Picture <input type="file" name="photos" accept="image/*" multiple></label>
+            <label>Send a Video <input type="file" name="videos" accept="video/*" multiple></label>
+            <button class="primary">Send message to selected students</button>
+          </form>
+        </section>
+        """
 
     def bulk_imports_get(self, result=""):
         if not self.can_bulk_import():
@@ -2611,6 +2637,65 @@ class App(BaseHTTPRequestHandler):
         for recipient in recipients:
             send_email(recipient, subject, body)
 
+    def create_sponsor_message(self, student_id, note, file_fields=None):
+        with db() as conn:
+            message_id = conn.execute(
+                "INSERT INTO sponsor_messages (sponsor_id,student_id,note,status,created_at) VALUES (?,?,?,?,?)",
+                (self.user["sponsor_id"], student_id, note, "submitted", now()),
+            ).lastrowid
+        if file_fields:
+            for field, kind in file_fields:
+                field.file.seek(0)
+                fid = self.save_file(field, kind, self.user["id"])
+                if fid:
+                    with db() as conn:
+                        conn.execute("UPDATE update_files SET sponsor_message_id=? WHERE id=?", (message_id, fid))
+        with db() as conn:
+            self.send_sponsor_message_notifications(conn, message_id)
+        return message_id
+
+    def sponsor_message_file_fields(self, form):
+        fields = []
+        if isinstance(form, MultipartForm):
+            for name, kind in (("photos", "sponsor_photo"), ("videos", "sponsor_video")):
+                if name in form:
+                    values = form[name] if isinstance(form[name], list) else [form[name]]
+                    for field in values:
+                        if not getattr(field, "filename", ""):
+                            continue
+                        field.file.seek(0)
+                        fields.append((MultipartField(field.name, field.filename, field.type, field.file.read()), kind))
+        return fields
+
+    def portal_bulk_message_post(self):
+        if self.user["role"] != "sponsor":
+            raise PermissionError()
+        try:
+            form = self.form_fields()
+            note = self.val(form, "note")
+            student_ids = [int(student_id) for student_id in self.vals(form, "student_ids")]
+            if not note:
+                return self.dashboard_with_bulk_message("Please write a short message before sending.")
+            if not student_ids:
+                return self.dashboard_with_bulk_message("Please choose at least one student.")
+            for student_id in student_ids:
+                if not self.sponsor_can_view_student(student_id, approved_only=False):
+                    raise PermissionError()
+            file_fields = self.sponsor_message_file_fields(form)
+            for student_id in student_ids:
+                self.create_sponsor_message(student_id, note, file_fields)
+            count = len(student_ids)
+            word = "student" if count == 1 else "students"
+            return self.redirect(f"/dashboard?message={urllib.parse.quote(f'Your message was sent to the Mission-Haiti team for {count} {word}.')}")
+        except ValueError as exc:
+            return self.dashboard_with_bulk_message(str(exc))
+        except (OSError, sqlite3.Error) as exc:
+            return self.dashboard_with_bulk_message(f"Your message could not be sent: {exc}")
+
+    def dashboard_with_bulk_message(self, message):
+        self.query = {"message": [message]}
+        return self.dashboard()
+
     def portal_message_post(self, student_id):
         if self.user["role"] != "sponsor" or not self.sponsor_can_view_student(student_id, approved_only=False):
             raise PermissionError()
@@ -2619,22 +2704,7 @@ class App(BaseHTTPRequestHandler):
             note = self.val(form, "note")
             if not note:
                 return self.portal_student(student_id, "Please write a short message before sending.")
-            with db() as conn:
-                message_id = conn.execute(
-                    "INSERT INTO sponsor_messages (sponsor_id,student_id,note,status,created_at) VALUES (?,?,?,?,?)",
-                    (self.user["sponsor_id"], student_id, note, "submitted", now()),
-                ).lastrowid
-            if isinstance(form, MultipartForm):
-                for name, kind in (("photos", "sponsor_photo"), ("videos", "sponsor_video")):
-                    if name in form:
-                        fields = form[name] if isinstance(form[name], list) else [form[name]]
-                        for field in fields:
-                            fid = self.save_file(field, kind, self.user["id"])
-                            if fid:
-                                with db() as conn:
-                                    conn.execute("UPDATE update_files SET sponsor_message_id=? WHERE id=?", (message_id, fid))
-            with db() as conn:
-                self.send_sponsor_message_notifications(conn, message_id)
+            self.create_sponsor_message(student_id, note, self.sponsor_message_file_fields(form))
             return self.redirect(f"/portal/students/{student_id}?message={urllib.parse.quote('Your message was sent to the Mission-Haiti team.')}")
         except ValueError as exc:
             return self.portal_student(student_id, str(exc))
