@@ -51,7 +51,7 @@ UPLOAD_DIR = DATA_DIR / "uploads" / "private"
 DB_PATH = DATA_DIR / "mission_haiti.db"
 STATIC_DIR = ROOT / "static"
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-only-change-me-before-deploying")
-MAX_UPLOAD_BYTES = 75 * 1024 * 1024
+MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 COOKIE_SECURE = APP_BASE_URL.startswith("https://")
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -1587,7 +1587,7 @@ class App(BaseHTTPRequestHandler):
           <label>Birthdate <input type="date" name="birthdate"></label>
           <label>Sex <select name="sex"><option value="">Choose one</option><option>Female</option><option>Male</option></select></label>
           <label>Profile photo <input type="file" name="profile_photo" accept=".jpg,.jpeg,.png,image/jpeg,image/png"></label>
-          <p class="hint">JPG, JPEG, or PNG photos up to 75 MB.</p>
+          <p class="hint">JPG, JPEG, or PNG photos up to 250 MB.</p>
           <label class="check"><input type="checkbox" name="active" checked> Active</label>
           <button class="primary">Save student</button>
         </form>
@@ -1681,7 +1681,7 @@ class App(BaseHTTPRequestHandler):
           <label>Birthdate <input type="date" name="birthdate" value="{escape(student["birthdate"] or "")}"></label>
           <label>Sex <select name="sex"><option value="">Choose one</option>{sex_options}</select></label>
           <label>Replace profile photo <input type="file" name="profile_photo" accept=".jpg,.jpeg,.png,image/jpeg,image/png"></label>
-          <p class="hint">JPG, JPEG, or PNG photos up to 75 MB.</p>
+          <p class="hint">JPG, JPEG, or PNG photos up to 250 MB.</p>
           <label class="check"><input type="checkbox" name="active" {active_checked}> Active</label>
           <button class="primary">Save changes</button>
         </form>
@@ -2258,6 +2258,7 @@ class App(BaseHTTPRequestHandler):
           <label>Grades/report card <input type="file" name="report_card" accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"></label>
           <label>Photos <input type="file" name="photos" accept="image/*" multiple></label>
           <label>Videos <input type="file" name="videos" accept="video/*" multiple></label>
+          <p class="hint">Uploads can include photos, videos, and report cards up to 250 MB total per submission.</p>
           <button class="primary">Save draft</button>
         </form>
         """
@@ -2680,6 +2681,7 @@ class App(BaseHTTPRequestHandler):
             <label>Message <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your student."></textarea></label>
             <label>Pictures <input type="file" name="photos" accept="image/*" multiple></label>
             <label>Videos <input type="file" name="videos" accept="video/*" multiple></label>
+            <p class="hint">Uploads can include pictures and videos up to 250 MB total per message.</p>
             <p class="hint">The Mission-Haiti team reviews sponsor messages before sharing them with students in Haiti.</p>
             <button class="primary">Send message</button>
           </form>
