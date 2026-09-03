@@ -405,6 +405,20 @@ button,
   gap: 10px;
   flex-wrap: wrap;
 }
+.section-jump {
+  margin-bottom: 16px;
+}
+.message-history {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+.sectionhead {
+  margin: 24px 0 14px;
+}
+.sectionhead h2 {
+  margin-bottom: 0;
+}
 .note {
   white-space: pre-wrap;
   line-height: 1.6;

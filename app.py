@@ -2652,6 +2652,9 @@ class App(BaseHTTPRequestHandler):
             f'<li>{escape(message_row["created_at"][:10])}: <span class="pill">{escape(message_row["status"])}</span> {escape(message_row["note"][:90])}</li>'
             for message_row in sponsor_messages
         )
+        previous_messages_html = ""
+        if previous_messages:
+            previous_messages_html = f'''<div class="message-history"><h3>Messages You've Sent</h3><ul class="list">{previous_messages}</ul></div>'''
         body = f"""
         <header class="pagehead"><div><p class="eyebrow">Sponsor portal</p><h1>{escape(student["name"])}</h1></div></header>
         <section class="mission-banner sponsor">
@@ -2663,8 +2666,15 @@ class App(BaseHTTPRequestHandler):
           </div>
         </section>
         <section class="detail"><div class="panel">{self.student_card(student, portal=True)}</div><div class="panel"><h2>Student information</h2>{self.student_info_list(student)}</div></section>
-        <section class="panel">
-          <h2>Send encouragement to {escape(student["name"])}</h2>
+        <section class="panel section-jump">
+          <h2>Messages</h2>
+          <div class="actions">
+            <a class="button primary" href="#messages-you-sent">Messages You've Sent</a>
+            <a class="button" href="#messages-from-mission-haiti">Messages from Mission-Haiti</a>
+          </div>
+        </section>
+        <section id="messages-you-sent" class="panel">
+          <h2>Messages You've Sent</h2>
           {f'<p class="notice">{escape(message)}</p>' if message and "sent" in message.lower() else f'<p class="alert">{escape(message)}</p>' if message else ''}
           <form class="form" method="post" action="/portal/students/{student_id}/messages" enctype="multipart/form-data">
             <label>Message <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your student."></textarea></label>
@@ -2673,9 +2683,12 @@ class App(BaseHTTPRequestHandler):
             <p class="hint">The Mission-Haiti team reviews sponsor messages before sharing them with students in Haiti.</p>
             <button class="primary">Send message</button>
           </form>
-          {f'<h3>Recently sent</h3><ul class="list">{previous_messages}</ul>' if previous_messages else ''}
+          {previous_messages_html}
         </section>
-        <section>{body_updates or '<div class="panel"><p class="muted">No approved updates yet.</p></div>'}</section>
+        <section id="messages-from-mission-haiti">
+          <header class="sectionhead"><p class="eyebrow">Approved updates</p><h2>Messages from Mission-Haiti</h2></header>
+          {body_updates or '<div class="panel"><p class="muted">No approved updates yet.</p></div>'}
+        </section>
         """
         return self.send_html(self.layout(student["name"], body))
 
