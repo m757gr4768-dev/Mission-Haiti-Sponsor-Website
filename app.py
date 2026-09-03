@@ -2817,7 +2817,7 @@ class App(BaseHTTPRequestHandler):
                 """
             items.append(f"""
             <div class="filecard">
-              <a class="filelink" href="/files/{f["id"]}" target="_blank" rel="noopener">
+              <a class="filelink" href="/files/{f["id"]}">
                 {preview}
                 <span>{escape(label)}</span>
                 <b>{escape(display_name)}</b>
