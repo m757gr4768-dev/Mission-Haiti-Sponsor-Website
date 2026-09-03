@@ -2757,12 +2757,12 @@ class App(BaseHTTPRequestHandler):
         <section class="panel section-jump">
           <h2>Coordinations Between You and Your Sponsor</h2>
           <div class="actions">
-            <a class="button primary" href="#messages-you-sent">Send a Message to Your Sponsor</a>
+            <a class="button primary" href="#messages-you-sent">Messages from Your Student</a>
             <a class="button" href="#messages-from-mission-haiti">Messages from Your Sponsor</a>
           </div>
         </section>
         <section id="messages-you-sent" class="panel">
-          <h2>Send a message to your sponsor</h2>
+          <h2>Messages from Your Student</h2>
           {f'<p class="notice">{escape(message)}</p>' if message and "sent" in message.lower() else f'<p class="alert">{escape(message)}</p>' if message else ''}
           <form class="form" method="post" action="/portal/students/{student_id}/messages" enctype="multipart/form-data">
             <p class="hint">Uploads can include pictures and videos up to 250 MB total per message.</p>
