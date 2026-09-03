@@ -2727,6 +2727,7 @@ class App(BaseHTTPRequestHandler):
         items = []
         for f in files:
             label = FILE_KINDS.get(f["kind"], f["kind"])
+            is_media = f["content_type"].startswith("image/") or f["content_type"].startswith("video/")
             if f["content_type"].startswith("image/"):
                 preview = f'<img class="thumb" alt="" src="/files/{f["id"]}">'
                 display_name = "Photo"
@@ -2736,6 +2737,7 @@ class App(BaseHTTPRequestHandler):
             else:
                 preview = '<div class="fileicon">FILE</div>'
                 display_name = f["original_name"]
+            download = f'<a class="button" href="/files/{f["id"]}?download=1">Download</a>' if is_media else ""
             remove = ""
             if self.user and (self.has_permission("create_updates") or self.has_permission("approve_updates")):
                 remove = f"""
@@ -2745,11 +2747,12 @@ class App(BaseHTTPRequestHandler):
                 """
             items.append(f"""
             <div class="filecard">
-              <a class="filelink" href="/files/{f["id"]}">
+              <a class="filelink" href="/files/{f["id"]}" target="_blank" rel="noopener">
                 {preview}
                 <span>{escape(label)}</span>
                 <b>{escape(display_name)}</b>
               </a>
+              {download}
               {remove}
             </div>
             """)
@@ -2786,7 +2789,8 @@ class App(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", file["content_type"])
         self.send_header("Content-Length", str(path.stat().st_size))
-        self.send_header("Content-Disposition", f'inline; filename="{file["original_name"].replace(chr(34), "")}"')
+        disposition = "attachment" if self.query.get("download", [""])[0] == "1" else "inline"
+        self.send_header("Content-Disposition", f'{disposition}; filename="{file["original_name"].replace(chr(34), "")}"')
         self.send_header("Cache-Control", "private, no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
