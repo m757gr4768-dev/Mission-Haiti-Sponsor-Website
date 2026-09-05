@@ -24,6 +24,12 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:  # Thumbnails are skipped until Pillow is installed.
+    Image = None
+    ImageOps = None
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -52,6 +58,8 @@ DB_PATH = DATA_DIR / "mission_haiti.db"
 STATIC_DIR = ROOT / "static"
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-only-change-me-before-deploying")
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
+THUMBNAIL_MAX_SIZE = (520, 520)
+THUMBNAIL_QUALITY = 82
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 COOKIE_SECURE = APP_BASE_URL.startswith("https://")
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -273,6 +281,9 @@ def init_db():
                 storage_name TEXT NOT NULL UNIQUE,
                 content_type TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
+                thumbnail_storage_name TEXT UNIQUE,
+                thumbnail_content_type TEXT,
+                thumbnail_size_bytes INTEGER,
                 uploaded_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(update_id) REFERENCES updates(id) ON DELETE CASCADE,
@@ -436,6 +447,12 @@ def init_db():
         existing_file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(update_files)").fetchall()}
         if "sponsor_message_id" not in existing_file_columns:
             conn.execute("ALTER TABLE update_files ADD COLUMN sponsor_message_id INTEGER")
+        if "thumbnail_storage_name" not in existing_file_columns:
+            conn.execute("ALTER TABLE update_files ADD COLUMN thumbnail_storage_name TEXT UNIQUE")
+        if "thumbnail_content_type" not in existing_file_columns:
+            conn.execute("ALTER TABLE update_files ADD COLUMN thumbnail_content_type TEXT")
+        if "thumbnail_size_bytes" not in existing_file_columns:
+            conn.execute("ALTER TABLE update_files ADD COLUMN thumbnail_size_bytes INTEGER")
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count:
             return
@@ -888,11 +905,61 @@ class App(BaseHTTPRequestHandler):
                     target.unlink(missing_ok=True)
                     raise ValueError("Upload too large")
                 out.write(chunk)
+        thumbnail = self.create_thumbnail(storage_name, content_type)
         with db() as conn:
             return conn.execute(
-                "INSERT INTO update_files (update_id,kind,original_name,storage_name,content_type,size_bytes,uploaded_by,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (update_id, kind, original, storage_name, content_type, size, uploaded_by, now()),
+                """INSERT INTO update_files
+                   (update_id,kind,original_name,storage_name,content_type,size_bytes,thumbnail_storage_name,thumbnail_content_type,thumbnail_size_bytes,uploaded_by,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (update_id, kind, original, storage_name, content_type, size, thumbnail[0], thumbnail[1], thumbnail[2], uploaded_by, now()),
             ).lastrowid
+
+    def is_thumbnailable_image(self, content_type):
+        return bool(content_type and content_type.startswith("image/") and content_type != "image/svg+xml")
+
+    def create_thumbnail(self, storage_name, content_type):
+        if Image is None or not self.is_thumbnailable_image(content_type):
+            return (None, None, None)
+        source = UPLOAD_DIR / storage_name
+        if not source.exists():
+            return (None, None, None)
+        thumbnail_storage_name = f"{secrets.token_urlsafe(24)}.jpg"
+        target = UPLOAD_DIR / thumbnail_storage_name
+        try:
+            with Image.open(source) as image:
+                image = ImageOps.exif_transpose(image)
+                image.thumbnail(THUMBNAIL_MAX_SIZE)
+                if image.mode in ("RGBA", "LA", "P"):
+                    background = Image.new("RGB", image.size, "white")
+                    if image.mode == "P":
+                        image = image.convert("RGBA")
+                    background.paste(image, mask=image.getchannel("A") if "A" in image.getbands() else None)
+                    image = background
+                else:
+                    image = image.convert("RGB")
+                image.save(target, "JPEG", quality=THUMBNAIL_QUALITY, optimize=True, progressive=True)
+        except Exception:
+            target.unlink(missing_ok=True)
+            return (None, None, None)
+        return (thumbnail_storage_name, "image/jpeg", target.stat().st_size)
+
+    def ensure_thumbnail(self, file):
+        if not self.is_thumbnailable_image(file["content_type"]):
+            return None
+        thumbnail_name = file["thumbnail_storage_name"] if "thumbnail_storage_name" in file.keys() else None
+        thumbnail_type = file["thumbnail_content_type"] if "thumbnail_content_type" in file.keys() else None
+        thumbnail_size = file["thumbnail_size_bytes"] if "thumbnail_size_bytes" in file.keys() else None
+        if thumbnail_name and (UPLOAD_DIR / thumbnail_name).exists():
+            return (UPLOAD_DIR / thumbnail_name, thumbnail_type or "image/jpeg", thumbnail_size or (UPLOAD_DIR / thumbnail_name).stat().st_size)
+        thumbnail = self.create_thumbnail(file["storage_name"], file["content_type"])
+        if not thumbnail[0]:
+            return None
+        with db() as conn:
+            conn.execute(
+                "UPDATE update_files SET thumbnail_storage_name=?, thumbnail_content_type=?, thumbnail_size_bytes=? WHERE id=?",
+                (thumbnail[0], thumbnail[1], thumbnail[2], file["id"]),
+            )
+        return (UPLOAD_DIR / thumbnail[0], thumbnail[1], thumbnail[2])
 
     def save_import_url(self, conn, url, kind, uploaded_by, update_id):
         parsed = urllib.parse.urlparse(url)
@@ -922,9 +989,12 @@ class App(BaseHTTPRequestHandler):
         except Exception:
             target.unlink(missing_ok=True)
             raise
+        thumbnail = self.create_thumbnail(storage_name, content_type)
         return conn.execute(
-            "INSERT INTO update_files (update_id,kind,original_name,storage_name,content_type,size_bytes,uploaded_by,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (update_id, kind, original, storage_name, content_type, size, uploaded_by, now()),
+            """INSERT INTO update_files
+               (update_id,kind,original_name,storage_name,content_type,size_bytes,thumbnail_storage_name,thumbnail_content_type,thumbnail_size_bytes,uploaded_by,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (update_id, kind, original, storage_name, content_type, size, thumbnail[0], thumbnail[1], thumbnail[2], uploaded_by, now()),
         ).lastrowid, storage_name
 
     def validate_import_host(self, hostname):
@@ -1573,7 +1643,7 @@ class App(BaseHTTPRequestHandler):
 
     def student_card(self, student, portal=False):
         url = f"/portal/students/{student['id']}" if portal else f"/students/{student['id']}"
-        photo = f'<img alt="" src="/files/{student["profile_photo_file_id"]}">' if student["profile_photo_file_id"] else '<div class="avatar">MH</div>'
+        photo = f'<img alt="" src="/files/{student["profile_photo_file_id"]}?thumb=1" loading="lazy">' if student["profile_photo_file_id"] else '<div class="avatar">MH</div>'
         status = "Active" if student["active"] else "Inactive"
         student_number = f'ID {escape(student["student_number"])} · ' if "student_number" in student.keys() and student["student_number"] else ""
         age = f' · Age {escape(student["age"])}' if "age" in student.keys() and student["age"] is not None else ""
@@ -1758,17 +1828,14 @@ class App(BaseHTTPRequestHandler):
                 if new_photo_id:
                     conn.execute("UPDATE students SET profile_photo_file_id=? WHERE id=?", (new_photo_id, student_id))
                     if old_photo_id:
-                        old_file = conn.execute("SELECT storage_name FROM update_files WHERE id=?", (old_photo_id,)).fetchone()
+                        old_file = conn.execute("SELECT storage_name, thumbnail_storage_name FROM update_files WHERE id=?", (old_photo_id,)).fetchone()
                         conn.execute("DELETE FROM update_files WHERE id=?", (old_photo_id,))
                     else:
                         old_file = None
                 else:
                     old_file = None
             if old_file:
-                try:
-                    (UPLOAD_DIR / old_file["storage_name"]).unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self.delete_storage_files(self.storage_names_for_files([old_file]))
             return self.redirect(f"/students/{student_id}")
         except ValueError as exc:
             return self.student_edit_get(student_id, str(exc))
@@ -1785,18 +1852,18 @@ class App(BaseHTTPRequestHandler):
                     return self.not_found()
                 update_ids = [row["id"] for row in conn.execute("SELECT id FROM updates WHERE student_id=?", (student_id,)).fetchall()]
                 if student["profile_photo_file_id"]:
-                    file = conn.execute("SELECT storage_name FROM update_files WHERE id=?", (student["profile_photo_file_id"],)).fetchone()
+                    file = conn.execute("SELECT storage_name, thumbnail_storage_name FROM update_files WHERE id=?", (student["profile_photo_file_id"],)).fetchone()
                     if file:
-                        storage_names.append(file["storage_name"])
+                        storage_names.extend(self.storage_names_for_files([file]))
                 if update_ids:
-                    for file in conn.execute(f"SELECT storage_name FROM update_files WHERE update_id IN ({qmarks(update_ids)})", update_ids).fetchall():
-                        storage_names.append(file["storage_name"])
+                    for file in conn.execute(f"SELECT storage_name, thumbnail_storage_name FROM update_files WHERE update_id IN ({qmarks(update_ids)})", update_ids).fetchall():
+                        storage_names.extend(self.storage_names_for_files([file]))
                     conn.execute(f"DELETE FROM email_notifications WHERE update_id IN ({qmarks(update_ids)})", update_ids)
                     conn.execute(f"DELETE FROM sms_notifications WHERE update_id IN ({qmarks(update_ids)})", update_ids)
                 message_ids = [row["id"] for row in conn.execute("SELECT id FROM sponsor_messages WHERE student_id=?", (student_id,)).fetchall()]
                 if message_ids:
-                    for file in conn.execute(f"SELECT storage_name FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids).fetchall():
-                        storage_names.append(file["storage_name"])
+                    for file in conn.execute(f"SELECT storage_name, thumbnail_storage_name FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids).fetchall():
+                        storage_names.extend(self.storage_names_for_files([file]))
                     conn.execute(f"DELETE FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids)
                     conn.execute("DELETE FROM sponsor_messages WHERE student_id=?", (student_id,))
                 conn.execute("DELETE FROM sponsor_students WHERE student_id=?", (student_id,))
@@ -2039,8 +2106,8 @@ class App(BaseHTTPRequestHandler):
                     return self.not_found()
                 message_ids = [row["id"] for row in conn.execute("SELECT id FROM sponsor_messages WHERE sponsor_id=?", (sponsor_id,)).fetchall()]
                 if message_ids:
-                    for file in conn.execute(f"SELECT storage_name FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids).fetchall():
-                        storage_names.append(file["storage_name"])
+                    for file in conn.execute(f"SELECT storage_name, thumbnail_storage_name FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids).fetchall():
+                        storage_names.extend(self.storage_names_for_files([file]))
                     conn.execute(f"DELETE FROM update_files WHERE sponsor_message_id IN ({qmarks(message_ids)})", message_ids)
                     conn.execute("DELETE FROM sponsor_messages WHERE sponsor_id=?", (sponsor_id,))
                 if sponsor["user_id"]:
@@ -2587,10 +2654,10 @@ class App(BaseHTTPRequestHandler):
         if not (self.has_permission("create_updates") or self.has_permission("approve_updates")):
             raise PermissionError()
         with db() as conn:
-            files = conn.execute("SELECT storage_name FROM update_files WHERE sponsor_message_id=?", (message_id,)).fetchall()
+            files = conn.execute("SELECT storage_name, thumbnail_storage_name FROM update_files WHERE sponsor_message_id=?", (message_id,)).fetchall()
             conn.execute("DELETE FROM update_files WHERE sponsor_message_id=?", (message_id,))
             conn.execute("DELETE FROM sponsor_messages WHERE id=?", (message_id,))
-        self.delete_storage_files([file["storage_name"] for file in files])
+        self.delete_storage_files(self.storage_names_for_files(files))
         return self.redirect("/sponsor-messages")
 
     def send_sponsor_message_notifications(self, conn, message_id):
@@ -2799,7 +2866,7 @@ class App(BaseHTTPRequestHandler):
             label = FILE_KINDS.get(f["kind"], f["kind"])
             is_media = f["content_type"].startswith("image/") or f["content_type"].startswith("video/")
             if f["content_type"].startswith("image/"):
-                preview = f'<img class="thumb" alt="" src="/files/{f["id"]}">'
+                preview = f'<img class="thumb" alt="" src="/files/{f["id"]}?thumb=1" loading="lazy">'
                 display_name = "Photo"
             elif f["content_type"].startswith("video/"):
                 preview = f'<video class="thumb" controls preload="metadata" src="/files/{f["id"]}"></video>'
@@ -2853,15 +2920,22 @@ class App(BaseHTTPRequestHandler):
                     ).fetchone())
             if not allowed:
                 raise PermissionError()
-        path = UPLOAD_DIR / file["storage_name"]
+        thumb_requested = self.query.get("thumb", [""])[0] == "1" and self.query.get("download", [""])[0] != "1"
+        thumb = self.ensure_thumbnail(file) if thumb_requested else None
+        if thumb:
+            path, response_type, response_size = thumb
+        else:
+            path = UPLOAD_DIR / file["storage_name"]
+            response_type = file["content_type"]
+            response_size = path.stat().st_size if path.exists() else 0
         if not path.exists():
             return self.not_found()
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", file["content_type"])
-        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Content-Type", response_type)
+        self.send_header("Content-Length", str(response_size))
         disposition = "attachment" if self.query.get("download", [""])[0] == "1" else "inline"
         self.send_header("Content-Disposition", f'{disposition}; filename="{file["original_name"].replace(chr(34), "")}"')
-        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Cache-Control", "private, max-age=86400" if thumb_requested else "private, no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         with path.open("rb") as src:
@@ -2876,15 +2950,24 @@ class App(BaseHTTPRequestHandler):
                 return self.not_found()
             conn.execute("UPDATE students SET profile_photo_file_id=NULL WHERE profile_photo_file_id=?", (file_id,))
             conn.execute("DELETE FROM update_files WHERE id=?", (file_id,))
-        path = UPLOAD_DIR / file["storage_name"]
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        self.delete_storage_files(self.storage_names_for_files([file]))
         return self.redirect(self.return_path())
+
+    def storage_names_for_files(self, files):
+        storage_names = []
+        for file in files:
+            if not file:
+                continue
+            if "storage_name" in file.keys() and file["storage_name"]:
+                storage_names.append(file["storage_name"])
+            if "thumbnail_storage_name" in file.keys() and file["thumbnail_storage_name"]:
+                storage_names.append(file["thumbnail_storage_name"])
+        return storage_names
 
     def delete_storage_files(self, storage_names):
         for storage_name in storage_names:
+            if not storage_name:
+                continue
             try:
                 (UPLOAD_DIR / storage_name).unlink(missing_ok=True)
             except OSError:
