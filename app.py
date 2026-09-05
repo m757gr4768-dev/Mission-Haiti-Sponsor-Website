@@ -448,7 +448,11 @@ def init_db():
         if "sponsor_message_id" not in existing_file_columns:
             conn.execute("ALTER TABLE update_files ADD COLUMN sponsor_message_id INTEGER")
         if "thumbnail_storage_name" not in existing_file_columns:
-            conn.execute("ALTER TABLE update_files ADD COLUMN thumbnail_storage_name TEXT UNIQUE")
+            conn.execute("ALTER TABLE update_files ADD COLUMN thumbnail_storage_name TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_update_files_thumbnail_storage_name "
+            "ON update_files(thumbnail_storage_name)"
+        )
         if "thumbnail_content_type" not in existing_file_columns:
             conn.execute("ALTER TABLE update_files ADD COLUMN thumbnail_content_type TEXT")
         if "thumbnail_size_bytes" not in existing_file_columns:
