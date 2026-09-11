@@ -13,17 +13,18 @@ import socket
 import smtplib
 import sqlite3
 import ssl
+import threading
 import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.parser import BytesParser
-from email.policy import default as email_policy
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
+
+from multipart import MultipartError, MultipartParser, parse_options_header
 
 try:
     from PIL import Image, ImageOps
@@ -58,8 +59,11 @@ DB_PATH = DATA_DIR / "mission_haiti.db"
 STATIC_DIR = ROOT / "static"
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-only-change-me-before-deploying")
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
+MAX_FORM_FIELD_BYTES = 1024 * 1024
+MAX_MULTIPART_PARTS = 128
 THUMBNAIL_MAX_SIZE = (520, 520)
 THUMBNAIL_QUALITY = 82
+THUMBNAIL_LOCK = threading.Lock()
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 COOKIE_SECURE = APP_BASE_URL.startswith("https://")
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -99,11 +103,12 @@ FILE_KINDS = {
 
 
 class MultipartField:
-    def __init__(self, name, filename, content_type, data, value=""):
+    def __init__(self, name, filename, content_type, data=None, value="", file=None, size=0):
         self.name = name
         self.filename = filename
         self.type = content_type
-        self.file = BytesIO(data)
+        self.file = file if file is not None else BytesIO(data or b"")
+        self.size = size if file is not None else len(data or b"")
         self.value = value
 
 
@@ -117,6 +122,13 @@ class MultipartForm(dict):
                 self[field.name] = [existing, field]
         else:
             self[field.name] = field
+
+    def close(self):
+        for value in self.values():
+            fields = value if isinstance(value, list) else [value]
+            for field in fields:
+                if getattr(field, "file", None):
+                    field.file.close()
 
 
 def now():
@@ -508,6 +520,7 @@ class App(BaseHTTPRequestHandler):
         self.path_only = parsed.path.rstrip("/") or "/"
         self.query = urllib.parse.parse_qs(parsed.query)
         self.user = self.current_user()
+        self._multipart_forms = []
         try:
             if self.path_only.startswith("/static/") and method == "GET":
                 return self.static_file(self.path_only.removeprefix("/static/"))
@@ -613,6 +626,9 @@ class App(BaseHTTPRequestHandler):
             return self.error_page(HTTPStatus.FORBIDDEN, "Access denied")
         except ValueError as exc:
             return self.error_page(HTTPStatus.BAD_REQUEST, str(exc) or "The request could not be processed.")
+        finally:
+            for form in self._multipart_forms:
+                form.close()
 
     def current_user(self):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
@@ -800,31 +816,61 @@ class App(BaseHTTPRequestHandler):
 
     def form_fields(self):
         content_type = self.headers.get("Content-Type", "")
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("Invalid upload size")
+        if length < 0:
+            raise ValueError("Invalid upload size")
         if length > MAX_UPLOAD_BYTES:
             raise ValueError("Upload too large")
         if content_type.startswith("multipart/form-data"):
-            body = self.rfile.read(length)
-            parser_input = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body
-            message = BytesParser(policy=email_policy).parsebytes(parser_input)
+            media_type, options = parse_options_header(content_type)
+            boundary = options.get("boundary")
+            if media_type != "multipart/form-data" or not boundary:
+                raise ValueError("Invalid upload form")
             form = MultipartForm()
-            for part in message.iter_parts():
-                disposition = part.get("Content-Disposition", "")
-                if "form-data" not in disposition:
-                    continue
-                name = part.get_param("name", header="content-disposition")
-                if not name:
-                    continue
-                filename = part.get_filename()
-                payload = part.get_payload(decode=True) or b""
-                if filename:
-                    field = MultipartField(name, filename, part.get_content_type(), payload)
-                else:
-                    charset = part.get_content_charset() or "utf-8"
-                    value = payload.decode(charset, errors="replace")
-                    field = MultipartField(name, "", part.get_content_type(), b"", value)
-                form.add(field)
-            return form
+            try:
+                parser = MultipartParser(
+                    self.rfile,
+                    boundary,
+                    content_length=length,
+                    strict=True,
+                    buffer_size=1024 * 1024,
+                    part_limit=MAX_MULTIPART_PARTS,
+                    partsize_limit=MAX_UPLOAD_BYTES,
+                    spool_limit=64 * 1024,
+                    memory_limit=MAX_FORM_FIELD_BYTES,
+                    disk_limit=MAX_UPLOAD_BYTES,
+                )
+                for part in parser:
+                    if not part.name:
+                        part.close()
+                        continue
+                    if part.filename:
+                        field = MultipartField(
+                            part.name,
+                            part.filename,
+                            part.content_type,
+                            file=part.file,
+                            size=part.size,
+                        )
+                        part.file = None
+                    else:
+                        if part.size > MAX_FORM_FIELD_BYTES:
+                            raise ValueError("A form field is too large")
+                        field = MultipartField(part.name, "", part.content_type, value=part.value)
+                        part.close()
+                    form.add(field)
+                if hasattr(self, "_multipart_forms"):
+                    self._multipart_forms.append(form)
+                return form
+            except (MultipartError, UnicodeError) as exc:
+                form.close()
+                raise ValueError("Invalid or incomplete upload") from exc
+            except ValueError:
+                form.close()
+                raise
         raw = self.rfile.read(length).decode()
         return urllib.parse.parse_qs(raw)
 
@@ -930,18 +976,19 @@ class App(BaseHTTPRequestHandler):
         thumbnail_storage_name = f"{secrets.token_urlsafe(24)}.jpg"
         target = UPLOAD_DIR / thumbnail_storage_name
         try:
-            with Image.open(source) as image:
-                image = ImageOps.exif_transpose(image)
-                image.thumbnail(THUMBNAIL_MAX_SIZE)
-                if image.mode in ("RGBA", "LA", "P"):
-                    background = Image.new("RGB", image.size, "white")
-                    if image.mode == "P":
-                        image = image.convert("RGBA")
-                    background.paste(image, mask=image.getchannel("A") if "A" in image.getbands() else None)
-                    image = background
-                else:
-                    image = image.convert("RGB")
-                image.save(target, "JPEG", quality=THUMBNAIL_QUALITY, optimize=True, progressive=True)
+            with THUMBNAIL_LOCK:
+                with Image.open(source) as image:
+                    image = ImageOps.exif_transpose(image)
+                    image.thumbnail(THUMBNAIL_MAX_SIZE)
+                    if image.mode in ("RGBA", "LA", "P"):
+                        background = Image.new("RGB", image.size, "white")
+                        if image.mode == "P":
+                            image = image.convert("RGBA")
+                        background.paste(image, mask=image.getchannel("A") if "A" in image.getbands() else None)
+                        image = background
+                    else:
+                        image = image.convert("RGB")
+                    image.save(target, "JPEG", quality=THUMBNAIL_QUALITY, optimize=True, progressive=True)
         except Exception:
             target.unlink(missing_ok=True)
             return (None, None, None)
@@ -2734,8 +2781,7 @@ class App(BaseHTTPRequestHandler):
                     for field in values:
                         if not getattr(field, "filename", ""):
                             continue
-                        field.file.seek(0)
-                        fields.append((MultipartField(field.name, field.filename, field.type, field.file.read()), kind))
+                        fields.append((field, kind))
         return fields
 
     def portal_bulk_message_post(self):
