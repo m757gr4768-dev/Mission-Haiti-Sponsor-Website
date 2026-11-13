@@ -731,6 +731,7 @@ class App(BaseHTTPRequestHandler):
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <title>{escape(title)} - Mission-Haiti</title>
           <link rel="stylesheet" href="/static/styles.css">
+          <script src="/static/sponsor-message-submit.js" defer></script>
         </head>
         <body>
           {nav}
@@ -1353,14 +1354,15 @@ class App(BaseHTTPRequestHandler):
         <section id="send-message-to-selected-students" class="panel">
           <h2>Send one message to multiple students</h2>
           {f'<p class="notice">{escape(message)}</p>' if message and "sent" in message.lower() else f'<p class="alert">{escape(message)}</p>' if message else ''}
-          <form class="form" method="post" action="/portal/messages" enctype="multipart/form-data">
+          <form class="form sponsor-message-form" method="post" action="/portal/messages" enctype="multipart/form-data">
             <p class="hint">Choose the students who should receive this same encouragement. Mission-Haiti will review each message before sharing it in Haiti.</p>
             <fieldset><legend>Students</legend>{options}</fieldset>
             <p class="hint">Uploads can include pictures and videos up to 250 MB total per message.</p>
             <label>Send a Note <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your students."></textarea></label>
             <label>Send a Picture <input type="file" name="photos" accept="image/*" multiple></label>
             <label>Send a Video <input type="file" name="videos" accept="video/*" multiple></label>
-            <button class="primary">Send message to selected students</button>
+            <button class="primary" data-sending-label="Sending message..." data-default-label="Send message to selected students">Send message to selected students</button>
+            <p class="sending-notice" role="status" aria-live="polite" hidden>Please wait while your message uploads. Do not click the send button again.</p>
           </form>
         </section>
         """
@@ -2881,13 +2883,14 @@ class App(BaseHTTPRequestHandler):
         <section id="messages-you-sent" class="panel">
           <h2>Send a Message to Your Student</h2>
           {f'<p class="notice">{escape(message)}</p>' if message and "sent" in message.lower() else f'<p class="alert">{escape(message)}</p>' if message else ''}
-          <form class="form" method="post" action="/portal/students/{student_id}/messages" enctype="multipart/form-data">
+          <form class="form sponsor-message-form" method="post" action="/portal/students/{student_id}/messages" enctype="multipart/form-data">
             <p class="hint">Uploads can include pictures and videos up to 250 MB total per message.</p>
             <label>Send a Note <textarea required name="note" rows="5" placeholder="Write a short note, prayer, or encouragement for your student."></textarea></label>
             <label>Send a Picture <input type="file" name="photos" accept="image/*" multiple></label>
             <label>Send a Video <input type="file" name="videos" accept="video/*" multiple></label>
             <p class="hint">The Mission-Haiti team reviews sponsor messages before sharing them with students in Haiti.</p>
-            <button class="primary">Send message</button>
+            <button class="primary" data-sending-label="Sending message..." data-default-label="Send message">Send message</button>
+            <p class="sending-notice" role="status" aria-live="polite" hidden>Please wait while your message uploads. Do not click the send button again.</p>
           </form>
           {previous_messages_html}
         </section>
@@ -3044,6 +3047,7 @@ class App(BaseHTTPRequestHandler):
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
+            ".js": "application/javascript; charset=utf-8",
         }.get(path.suffix.lower(), "application/octet-stream")
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)

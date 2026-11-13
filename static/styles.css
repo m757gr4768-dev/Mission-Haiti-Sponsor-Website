@@ -134,6 +134,24 @@ h2 { font-size: 1.25rem; }
   padding: 10px 12px;
   font-weight: 800;
 }
+
+.sending-notice {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  border-left: 4px solid #f4b63f;
+  background: #fff8e8;
+  color: #17382d;
+  font-weight: 700;
+}
+
+.sending-notice[hidden] {
+  display: none;
+}
+
+.sponsor-message-form button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
 .hint {
   margin: -8px 0 0;
   color: var(--muted);
